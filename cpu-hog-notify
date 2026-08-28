@@ -129,9 +129,24 @@ _top_procs() {
 # Killing
 # ==============================================================================
 
-# True if PID exists AND is still the same process instance.
+# True when the PID is gone for our purposes.
+#
+# A ZOMBIE COUNTS AS DEAD. It has already terminated and merely keeps
+# a /proc entry until its parent reaps it - which may never happen on
+# our timescale, and is not ours to wait for. Testing `[ -d /proc/PID ]`
+# alone reports a successful kill as "survived SIGKILL".
+_is_dead() {
+    local st
+    [ -e "/proc/$1/stat" ] || return 0
+    st="$(_stat_fields "$1" 2>/dev/null | awk '{print $1}')" || return 0
+    [ -z "$st" ] && return 0
+    [ "$st" = "Z" ] && return 0
+    return 1
+}
+
+# True if the PID is alive AND is still the same process instance.
 _still_same() {
-    [ -d "/proc/$1" ] || return 1
+    _is_dead "$1" && return 1
     [ "$(_starttime_of "$1")" = "$2" ] || return 1
     return 0
 }
@@ -142,7 +157,7 @@ _still_same() {
 _safe_kill() {
     local pid="$1" want_start="$2" comm="$3" now_start
 
-    if [ ! -d "/proc/$pid" ]; then
+    if _is_dead "$pid"; then
         notify-send --app-name="$APP_NAME" -u low -i dialog-information \
             "Already gone" "$comm (PID $pid) exited on its own."
         _log INFO "pid $pid already gone"
@@ -173,7 +188,7 @@ _safe_kill() {
     local _n
     for _n in 1 2 3 4 5 6; do
         sleep 0.5
-        [ -d "/proc/$pid" ] || break
+        _is_dead "$pid" && break
     done
     unset _n
 
