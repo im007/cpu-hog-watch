@@ -1,0 +1,334 @@
+#!/usr/bin/env bash
+#
+# cpu-hog-watch - alerts when one process saturates a CPU core
+# Copyright (C) 2026  im007
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version. This program comes
+# with ABSOLUTELY NO WARRANTY. See the LICENSE file for the full text.
+# Script: cpu-hog-notify
+# Purpose: Render the desktop popup for cpu-hog-watch and, if asked,
+#          terminate the offending process safely.
+#
+# WHY THIS IS A SEPARATE SCRIPT
+#   notify-send -A implies --wait: it blocks until the user clicks or
+#   the popup expires. Calling that inline from the timer service would
+#   hold the unit active for the whole popup lifetime and collide with
+#   the next tick. The watcher launches this as a transient unit.
+#
+# Prerequisites: bash 4+, libnotify
+#
+# Usage: cpu-hog-notify hog PID START COMM PCT MINS TEMP KILLBUTTON
+#        cpu-hog-notify thermal temp|fan VALUE SAMPLES
+#
+# Exit Codes:
+#   0 - Success
+#   2 - Invalid arguments
+#   4 - Refused to kill (safety check failed)
+#
+set -uo pipefail
+
+SCRIPT_NAME="$(basename "$0")"
+readonly SCRIPT_NAME
+readonly APP_NAME="CPU Hog Watch"
+# Popups are resident (-t 0) so an alert cannot fade while you are
+# away from the desk. This bounds the waiting helper, not the popup.
+readonly POPUP_TIMEOUT=21600
+# Below this share of one core, a "top consumer" is not worth
+# offering to kill - it is just the desktop doing its job.
+readonly KILL_OFFER_PCT=50
+
+_log() {
+    printf '[%s] [%s] [%s] %s\n' \
+        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$1" "$SCRIPT_NAME" "${*:2}" >&2
+}
+
+# ==============================================================================
+# Measurement
+# ==============================================================================
+
+# Same last-paren strip as the watcher: comm contains spaces and
+# parens ("Isolated Web Co"), so naive field numbering reads garbage.
+_stat_fields() {
+    local raw
+    raw="$(< "/proc/$1/stat")" 2>/dev/null || return 1
+    printf '%s\n' "${raw##*') '}"
+}
+
+_starttime_of() {
+    local rest; rest="$(_stat_fields "$1")" || return 1
+    local IFS=' '; local -a f; read -ra f <<< "$rest"
+    [ "${#f[@]}" -gt 19 ] || return 1
+    printf '%s\n' "${f[19]}"
+}
+
+_ticks_of() {
+    local rest; rest="$(_stat_fields "$1")" || return 1
+    local IFS=' '; local -a f; read -ra f <<< "$rest"
+    [ "${#f[@]}" -gt 12 ] || return 1
+    printf '%s\n' "$(( ${f[11]} + ${f[12]} ))"
+}
+
+_total_jiffies() {
+    local IFS=' '; local -a f
+    read -ra f < /proc/stat
+    local sum=0 i
+    for i in "${f[@]:1}"; do sum=$(( sum + i )); done
+    printf '%s\n' "$sum"
+}
+
+# Emit "<pct> <pid> <comm>" for the busiest processes, highest first.
+#
+# NOT `ps -eo pcpu`. That is a LIFETIME AVERAGE, so it under-reports a
+# process that just started misbehaving - it showed a pegged browser
+# tab as 78% when it was at 99.4%. Worse, it ranks ITSELF near 100%,
+# because ps is the newest and briefest thing in its own snapshot,
+# which is how "100 ps" ends up at the top of an alert.
+_top_procs() {
+    local want="${1:-3}" self=$$
+    local -A t0
+    local d pid ncpu tj0 tj1 elapsed delta pct comm
+    ncpu="$(grep -c '^cpu[0-9]' /proc/stat)"
+    [ "$ncpu" -ge 1 ] || ncpu=1
+
+    tj0="$(_total_jiffies)"
+    for d in /proc/[0-9]*; do
+        pid="${d#/proc/}"
+        [ "$pid" = "$self" ] && continue
+        [ -O "$d" ] || continue
+        t0[$pid]="$(_ticks_of "$pid")" 2>/dev/null || true
+    done
+
+    sleep 1
+
+    tj1="$(_total_jiffies)"
+    elapsed=$(( (tj1 - tj0) / ncpu ))
+    [ "$elapsed" -gt 0 ] || elapsed=100
+
+    for pid in "${!t0[@]}"; do
+        [ -n "${t0[$pid]}" ] || continue
+        delta="$(_ticks_of "$pid" 2>/dev/null)" || continue
+        pct=$(( (delta - ${t0[$pid]}) * 100 / elapsed ))
+        [ "$pct" -gt 0 ] || continue
+        comm="$(cat "/proc/$pid/comm" 2>/dev/null)" || continue
+        printf '%s %s %s\n' "$pct" "$pid" "$comm"
+    done | sort -rn | head -n "$want"
+}
+
+_cpu_temp_c() {
+    local h lbl inp
+    for h in /sys/class/hwmon/hwmon*; do
+        [ "$(cat "$h/name" 2>/dev/null)" = "k10temp" ] || continue
+        for lbl in "$h"/temp*_label; do
+            [ -e "$lbl" ] || continue
+            [ "$(cat "$lbl" 2>/dev/null)" = "Tctl" ] || continue
+            inp="${lbl%_label}_input"
+            [ -r "$inp" ] && printf '%s\n' "$(( $(cat "$inp") / 1000 ))"
+            return 0
+        done
+    done
+    return 1
+}
+
+_max_fan_rpm() {
+    local h f max=0 v
+    for h in /sys/class/hwmon/hwmon*; do
+        [ "$(cat "$h/name" 2>/dev/null)" = "cros_ec" ] || continue
+        for f in "$h"/fan*_input; do
+            [ -r "$f" ] || continue
+            v="$(cat "$f" 2>/dev/null)" || continue
+            [ -n "$v" ] && [ "$v" -gt "$max" ] && max="$v"
+        done
+    done
+    [ "$max" -gt 0 ] && printf '%s\n' "$max"
+}
+
+# ==============================================================================
+# Killing
+# ==============================================================================
+
+# True if PID exists AND is still the same process instance.
+_still_same() {
+    [ -d "/proc/$1" ] || return 1
+    [ "$(_starttime_of "$1")" = "$2" ] || return 1
+    return 0
+}
+
+# Every guard here matters: minutes can pass between the popup
+# appearing and the click, and in that window the target may have
+# exited and had its PID recycled onto something important.
+_safe_kill() {
+    local pid="$1" want_start="$2" comm="$3" now_start
+
+    if [ ! -d "/proc/$pid" ]; then
+        notify-send --app-name="$APP_NAME" -u low -i dialog-information \
+            "Already gone" "$comm (PID $pid) exited on its own."
+        _log INFO "pid $pid already gone"
+        return 0
+    fi
+
+    now_start="$(_starttime_of "$pid")" || return 4
+    if [ "$now_start" != "$want_start" ]; then
+        notify-send --app-name="$APP_NAME" -u normal -i dialog-warning \
+            "Nothing killed" \
+            "PID $pid was recycled onto a different process."
+        _log WARN "pid $pid starttime changed; refused"
+        return 4
+    fi
+
+    if [ ! -O "/proc/$pid" ]; then
+        notify-send --app-name="$APP_NAME" -u normal -i dialog-warning \
+            "Nothing killed" "PID $pid is not owned by $USER."
+        _log WARN "pid $pid not owned by $USER; refused"
+        return 4
+    fi
+
+    # SIGTERM first. A Firefox content process dies cleanly on TERM and
+    # the parent shows about:tabcrashed with a Restore button.
+    _log INFO "sending SIGTERM to $pid ($comm)"
+    kill -TERM "$pid" 2>/dev/null || true
+
+    local _n
+    for _n in 1 2 3 4 5 6; do
+        sleep 0.5
+        [ -d "/proc/$pid" ] || break
+    done
+    unset _n
+
+    if _still_same "$pid" "$want_start"; then
+        _log WARN "pid $pid ignored SIGTERM, escalating to SIGKILL"
+        kill -KILL "$pid" 2>/dev/null || true
+        sleep 1
+    fi
+
+    if _still_same "$pid" "$want_start"; then
+        notify-send --app-name="$APP_NAME" -u critical -i dialog-error \
+            "Kill failed" "$comm (PID $pid) survived SIGKILL."
+        _log ERROR "pid $pid survived SIGKILL"
+        return 4
+    fi
+
+    notify-send --app-name="$APP_NAME" -u low -i dialog-information \
+        "Stopped $comm" \
+        "PID $pid is gone. A killed tab shows a Restore button."
+    _log INFO "pid $pid killed"
+    return 0
+}
+
+# ==============================================================================
+# Popups
+# ==============================================================================
+
+_is_browser() {
+    case "$1" in
+        *Web\ Co*|*Isolated*|*zen*|*firefox*|*chrome*|*chromium*)
+            return 0 ;;
+    esac
+    return 1
+}
+
+_do_hog() {
+    local pid="$1" start="$2" comm="$3" pct="$4" mins="$5" temp="$6"
+    local button="$7" title body action fan
+    local -a args
+
+    fan="$(_max_fan_rpm || echo '')"
+
+    title="$comm · ${pct}% of a core"
+
+    body="Held for <b>${mins} min</b> — PID ${pid}"
+    if [ -n "$temp" ] && [ "$temp" != "0" ]; then
+        body="$body"$'\n'"CPU ${temp} °C"
+        [ -n "$fan" ] && body="$body · fan ${fan} RPM"
+    fi
+    if _is_browser "$comm"; then
+        body="$body"$'\n\n'"Browser tab. Killing ends this tab only —"
+        body="$body"$'\n'"your session and other tabs keep running."
+    fi
+
+    args=(--app-name="$APP_NAME" -u critical -t 0)
+    args+=(-i utilities-system-monitor)
+
+    if [ "$button" = "true" ]; then
+        args+=(-A "kill=Stop it")
+        args+=(-A "ignore=Leave it")
+        action="$(timeout "$POPUP_TIMEOUT" \
+            notify-send "${args[@]}" "$title" "$body" 2>/dev/null)" \
+            || action=""
+        [ "$action" = "kill" ] && _safe_kill "$pid" "$start" "$comm"
+    else
+        notify-send "${args[@]}" "$title" "$body" 2>/dev/null || true
+    fi
+}
+
+_do_thermal() {
+    local kind="$1" value="$2" samples="$3"
+    local title body temp fan action top
+    local tp tpid tcomm start
+    local -a args
+
+    temp="$(_cpu_temp_c || echo '')"
+    fan="$(_max_fan_rpm || echo '')"
+
+    if [ "$kind" = "temp" ]; then
+        title="CPU holding at ${value} °C"
+    else
+        title="Fan pinned at ${value} RPM"
+    fi
+
+    if [ "$kind" = "temp" ]; then
+        body="Sustained <b>~${samples} min</b>"
+        [ -n "$fan" ] && body="$body · fan ${fan} RPM"
+    else
+        body="Sustained <b>~${samples} min</b>"
+        [ -n "$temp" ] && body="$body · CPU ${temp} °C"
+    fi
+
+    top="$(_top_procs 3)"
+    if [ -n "$top" ]; then
+        body="$body"$'\n\n'"<b>Top CPU users</b>"
+        while read -r tp tpid tcomm; do
+            [ -n "$tp" ] || continue
+            body="$body"$'\n'"${tp}%  ${tcomm}"
+        done <<< "$top"
+    fi
+
+    read -r tp tpid tcomm <<< "$(printf '%s\n' "$top" | head -1)"
+
+    args=(--app-name="$APP_NAME" -u normal -t 0 -i temperature-warm)
+
+    # Only offer a kill when one process is clearly to blame. A
+    # thermal alert with no dominant process is informational: there
+    # is nothing sensible to point a kill button at.
+    if [ -n "${tp:-}" ] && [ "$tp" -ge "$KILL_OFFER_PCT" ] \
+       && [ -d "/proc/$tpid" ]; then
+        start="$(_starttime_of "$tpid")" || start=""
+        if [ -n "$start" ]; then
+            args+=(-A "kill=Stop $tcomm")
+            args+=(-A "ignore=Leave it")
+            action="$(timeout "$POPUP_TIMEOUT" \
+                notify-send "${args[@]}" "$title" "$body" 2>/dev/null)" \
+                || action=""
+            [ "$action" = "kill" ] && _safe_kill "$tpid" "$start" "$tcomm"
+            return 0
+        fi
+    fi
+
+    notify-send "${args[@]}" "$title" "$body" 2>/dev/null || true
+}
+
+case "${1:-}" in
+    hog)
+        [ $# -eq 8 ] || { _log ERROR "hog: bad arg count"; exit 2; }
+        _do_hog "$2" "$3" "$4" "$5" "$6" "$7" "$8"
+        ;;
+    thermal)
+        [ $# -eq 4 ] || { _log ERROR "thermal: bad arg count"; exit 2; }
+        _do_thermal "$2" "$3" "$4"
+        ;;
+    *)
+        sed -n '/^# Script:/,/^$/p' "$0"; exit 2 ;;
+esac

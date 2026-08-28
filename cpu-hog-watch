@@ -1,0 +1,488 @@
+#!/usr/bin/env bash
+#
+# cpu-hog-watch - alerts when one process saturates a CPU core
+# Copyright (C) 2026  im007
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version. This program comes
+# with ABSOLUTELY NO WARRANTY. See the LICENSE file for the full text.
+# Script: cpu-hog-watch
+# Purpose: Alert when a single process saturates a CPU core for a
+#          sustained period, or when package temp / fan stay pinned.
+#
+# WHY THIS EXISTS
+#   One runaway browser tab is 1 saturated thread out of 16 on this
+#   machine - 6.25% system-wide. Every system-wide CPU monitor
+#   (psi-notify, systemd-oomd, plasma-systemmonitor, netdata defaults)
+#   is blind to that, while the fan sits at 4700 RPM for hours. The
+#   only signal that catches it is PER-PROCESS CPU normalised to ONE
+#   core. That is what this measures.
+#
+# Prerequisites: bash 4+, libnotify (notify-send). Runs as a systemd
+#   USER timer, not a system one, so notify-send can reach the Plasma
+#   session bus. A system unit has no session bus and notifies nobody.
+#
+# Usage: cpu-hog-watch [--dry-run] [--status] [--help]
+#
+# Exit Codes:
+#   0 - Success
+#   2 - Invalid arguments
+#   3 - Missing dependencies
+#
+# Environment Variables:
+#   CPU_HOG_ENV_FILE - config path (default ~/.config/cpu-hog-watch.env)
+#   SCRIPT_DEBUG     - "true" for per-sample debug output
+#   SCRIPT_DRY_RUN   - "true" to detect and log but never notify
+#
+
+set -uo pipefail
+
+SCRIPT_NAME="$(basename "$0")"
+readonly SCRIPT_NAME
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+readonly SCRIPT_DIR
+readonly SCRIPT_VERSION="1.0.0"
+
+# ==============================================================================
+# Configuration defaults (override in the env file)
+# ==============================================================================
+
+# Percent of ONE core. 85 means "essentially pegged".
+HOG_PCT="${HOG_PCT:-85}"
+# Consecutive samples above HOG_PCT before alerting. At a 60s timer
+# this is minutes. 10 keeps a normal compile or page load quiet.
+HOG_STRIKES="${HOG_STRIKES:-10}"
+
+# Thermal backstop. Catches heat we did not predict - GPU, firmware,
+# a stuck kworker - none of which the per-process check would see.
+THERM_C="${THERM_C:-92}"
+THERM_STRIKES="${THERM_STRIKES:-5}"
+FAN_RPM="${FAN_RPM:-4500}"
+FAN_STRIKES="${FAN_STRIKES:-15}"
+
+# Which hwmon sensors carry package temperature and fan speed. The
+# defaults are AMD (k10temp/Tctl) and the ChromeOS EC that Framework
+# and Chromebooks expose. Intel reports package temp through
+# `coretemp` with the label "Package id 0"; many laptops publish fans
+# through `thinkpad`, `dell_smm`, `asus_wmi` or `acpitz` instead.
+# `sensors` lists what this machine actually has.
+THERM_HWMON="${THERM_HWMON:-k10temp}"
+THERM_LABEL="${THERM_LABEL:-Tctl}"
+FAN_HWMON="${FAN_HWMON:-cros_ec}"
+
+# Processes that legitimately peg a core. Extended regex, matched
+# against both comm and full cmdline. Deliberately does NOT include
+# "claude" - a Claude process pegging a core for 10 minutes is
+# something you want to know about, not something to hide.
+_allow="cc1|cc1plus|collect2|rustc|ld\.lld|ld\.gold"
+_allow="$_allow|go build|cargo|ninja|make|ffmpeg|HandBrake"
+_allow="$_allow|x264|x265|whisper|dnf|rpmbuild|mock"
+_allow="$_allow|restic|borg|zstd|xz|7z"
+HOG_ALLOW_RE="${HOG_ALLOW_RE:-$_allow}"
+
+# Re-alert if the offender is STILL pegged this many samples after
+# the last popup (~minutes at a 60s timer). Without this a process
+# that misbehaves for hours warns you exactly once, then goes silent.
+HOG_RENOTIFY="${HOG_RENOTIFY:-30}"
+
+# Offer a "Kill it" button on the popup.
+HOG_KILL_BUTTON="${HOG_KILL_BUTTON:-true}"
+
+DEBUG="${SCRIPT_DEBUG:-false}"
+DRY_RUN="${SCRIPT_DRY_RUN:-false}"
+
+ENV_FILE="${CPU_HOG_ENV_FILE:-$HOME/.config/cpu-hog-watch.env}"
+STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}/cpu-hog-watch"
+STATE_FILE="$STATE_DIR/state"
+NOTIFY_HELPER="$SCRIPT_DIR/cpu-hog-notify"
+
+# ==============================================================================
+# Logging - stderr only. A user timer's stderr lands in the journal:
+#   journalctl --user -u cpu-hog-watch -f
+# Writing our own logfile would just duplicate journald badly.
+# ==============================================================================
+
+_log() {
+    local level="$1"; shift
+    printf '[%s] [%s] [%s] %s\n' \
+        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$level" "$SCRIPT_NAME" "$*" >&2
+}
+log_info()  { _log INFO  "$@"; }
+log_warn()  { _log WARN  "$@"; }
+log_error() { _log ERROR "$@"; }
+log_debug() { [ "$DEBUG" = "true" ] && _log DEBUG "$@"; return 0; }
+
+# ==============================================================================
+# /proc parsing
+# ==============================================================================
+
+# Emits "<utime+stime> <starttime>" for a PID, or returns 1.
+#
+# GOTCHA: the comm field is "(Isolated Web Co)" - it contains BOTH
+# spaces and parens, so awk $14/$15 field numbering is wrong and reads
+# garbage. Strip through the LAST ") " first. This bug is why `ps`
+# reported a pegged tab as "78%": ps %cpu is a LIFETIME AVERAGE, not
+# a current rate. Never use ps %cpu for this.
+_proc_sample() {
+    local raw rest
+    raw="$(< "/proc/$1/stat")" 2>/dev/null || return 1
+    [ -n "$raw" ] || return 1
+    rest="${raw##*') '}"
+    local IFS=' '
+    local -a f
+    read -ra f <<< "$rest"
+    # f[0] is field 3 (state). field N -> index N-3.
+    # utime=14 -> 11, stime=15 -> 12, starttime=22 -> 19
+    [ "${#f[@]}" -gt 19 ] || return 1
+    printf '%s %s\n' "$(( ${f[11]} + ${f[12]} ))" "${f[19]}"
+}
+
+# Total jiffies across all CPUs. Used instead of wall-clock elapsed
+# because this is a laptop: s2idle inflates wall clock while no ticks
+# accrue, which would score a suspend as a CPU spike. Jiffies cannot
+# advance while suspended, so this is immune.
+_total_jiffies() {
+    local IFS=' '
+    local -a f
+    read -ra f < /proc/stat
+    local sum=0 i
+    for i in "${f[@]:1}"; do sum=$(( sum + i )); done
+    printf '%s\n' "$sum"
+}
+
+# Resolve an hwmon path by its name file. hwmon NUMBERING IS NOT
+# STABLE ACROSS BOOTS - k10temp was hwmon12 today and may not be
+# tomorrow. Hardcoding the number is a bug that hides for weeks.
+_hwmon_by_name() {
+    local want="$1" h
+    for h in /sys/class/hwmon/hwmon*; do
+        if [ "$(cat "$h/name" 2>/dev/null)" = "$want" ]; then
+            printf '%s\n' "$h"; return 0
+        fi
+    done
+    return 1
+}
+
+# Package temperature in whole degrees C, or empty.
+_cpu_temp_c() {
+    local h lbl
+    h="$(_hwmon_by_name "$THERM_HWMON")" || return 1
+    for lbl in "$h"/temp*_label; do
+        [ -e "$lbl" ] || continue
+        if [ "$(cat "$lbl" 2>/dev/null)" = "$THERM_LABEL" ]; then
+            local inp="${lbl%_label}_input"
+            [ -r "$inp" ] || return 1
+            printf '%s\n' "$(( $(cat "$inp") / 1000 ))"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Highest fan RPM reported by the EC, or empty.
+_max_fan_rpm() {
+    local h f max=0 v
+    h="$(_hwmon_by_name "$FAN_HWMON")" || return 1
+    for f in "$h"/fan*_input; do
+        [ -r "$f" ] || continue
+        v="$(cat "$f" 2>/dev/null)" || continue
+        [ -n "$v" ] && [ "$v" -gt "$max" ] && max="$v"
+    done
+    [ "$max" -gt 0 ] || return 1
+    printf '%s\n' "$max"
+}
+
+# ==============================================================================
+# Alerting
+# ==============================================================================
+
+# Launch the popup OUTSIDE this unit's cgroup and sandbox.
+#
+# Two traps this avoids. (1) notify-send -A implies --wait, so it
+# blocks until clicked - running it inline would pin the timer service
+# active for the whole popup lifetime. (2) A plain setsid child still
+# sits in the oneshot's control group, and systemd reaps that group
+# the moment ExecStart returns, killing the popup before anyone sees
+# it. A transient unit escapes both.
+_spawn_helper() {
+    local tag bus
+    tag="chw-$$-${RANDOM}"
+    bus="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR}/bus}"
+    if command -v systemd-run >/dev/null 2>&1; then
+        if systemd-run --user --collect --quiet "--unit=$tag" \
+             "--setenv=DBUS_SESSION_BUS_ADDRESS=$bus" \
+             -- "$NOTIFY_HELPER" "$@"; then
+            return 0
+        fi
+        log_warn "systemd-run failed; falling back to setsid"
+    fi
+    setsid "$NOTIFY_HELPER" "$@" >/dev/null 2>&1 &
+}
+
+_alert_hog() {
+    local pid="$1" start="$2" name="$3" pct="$4" mins="$5" temp="$6"
+    if [ "$DRY_RUN" = "true" ]; then
+        log_warn "DRY_RUN: would alert on pid=$pid ($name) ${pct}% ${mins}min"
+        return 0
+    fi
+    if [ ! -x "$NOTIFY_HELPER" ]; then
+        log_error "notify helper missing or not executable: $NOTIFY_HELPER"
+        return 1
+    fi
+    _spawn_helper hog "$pid" "$start" "$name" "$pct" "$mins" \
+        "$temp" "$HOG_KILL_BUTTON"
+    log_warn "alerted: pid=$pid comm=$name ${pct}% of one core for ${mins}min"
+}
+
+_alert_thermal() {
+    local kind="$1" value="$2" mins="$3"
+    if [ "$DRY_RUN" = "true" ]; then
+        log_warn "DRY_RUN: would alert thermal $kind=$value for ${mins}min"
+        return 0
+    fi
+    [ -x "$NOTIFY_HELPER" ] || return 1
+    _spawn_helper thermal "$kind" "$value" "$mins"
+    log_warn "alerted: thermal $kind=$value sustained ${mins} samples"
+}
+
+# ==============================================================================
+# Main
+# ==============================================================================
+
+# Anchored, not a line range: prepending a license header shifted
+# the old `sed -n 2,30p` and --help started printing the licence.
+usage() {
+    sed -n '/^# Script:/,/^$/p' "$0"
+    exit "${1:-0}"
+}
+
+main() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --dry-run) DRY_RUN=true ;;
+            --status)  _print_status; exit 0 ;;
+            -h|--help) usage 0 ;;
+            *) echo "unknown argument: $1" >&2; usage 2 ;;
+        esac
+        shift
+    done
+
+    command -v notify-send >/dev/null 2>&1 || {
+        log_error "notify-send not found (dnf install libnotify)"; exit 3; }
+
+    if [ -r "$ENV_FILE" ]; then
+        set -a
+        # shellcheck disable=SC1090  # resolved at runtime by design
+        . "$ENV_FILE"
+        set +a
+        # Re-read after sourcing: DEBUG was evaluated at script start,
+        # before this file existed in the environment.
+        DEBUG="${SCRIPT_DEBUG:-$DEBUG}"
+        log_debug "loaded config from $ENV_FILE"
+    fi
+
+    mkdir -p "$STATE_DIR"
+
+    local ncpu total_now total_prev elapsed
+    # NOT `nproc`: coreutils honours the cgroup CPU quota, so under
+    # this unit's CPUQuota=50% it returns 1, not 16. That inflates
+    # `elapsed` 16x and divides every pct by 16 - a pegged core scored
+    # as 6% and NOTHING EVER ALERTED. Count the same source the
+    # jiffies come from, so numerator and denominator cannot disagree.
+    ncpu="$(grep -c '^cpu[0-9]' /proc/stat)"
+    [ "$ncpu" -ge 1 ] || ncpu=1
+    total_now="$(_total_jiffies)"
+
+    # ---- load previous state -------------------------------------------
+    declare -A prev_ticks prev_strikes prev_alerted
+    local prev_total=0 key a b c
+    # Counted by hand: ${#prev_ticks[@]} on an EMPTY associative array
+    # raises "unbound variable" under set -u, which killed every run
+    # after a fresh boot and never recovered.
+    local n_prev=0
+    if [ -r "$STATE_FILE" ]; then
+        while IFS=' ' read -r key a b c; do
+            case "$key" in
+                "#total") prev_total="$a" ;;
+                "#therm") prev_strikes[therm]="$a"; prev_alerted[therm]="$b" ;;
+                "#fan")   prev_strikes[fan]="$a";   prev_alerted[fan]="$b"   ;;
+                "") ;;
+                *) prev_ticks[$key]="$a"
+                   prev_strikes[$key]="$b"
+                   prev_alerted[$key]="$c"
+                   n_prev=$(( n_prev + 1 )) ;;
+            esac
+        done < "$STATE_FILE"
+    fi
+
+    log_debug "state read: entries=$n_prev prev_total=$prev_total"
+
+    total_prev="$prev_total"
+    elapsed=$(( (total_now - total_prev) / ncpu ))
+
+    # First run, or a discontinuity (counter wrap / state reset):
+    # re-baseline without scoring. Scoring a bogus delta is how a
+    # monitor earns itself an instant mute.
+    local scoring=true
+    if [ "$total_prev" -le 0 ] || [ "$elapsed" -le 0 ]; then
+        scoring=false
+        log_info "re-baselining (no usable previous sample)"
+    fi
+
+    # ---- sample this user's processes ----------------------------------
+    local tmp; tmp="$(mktemp "$STATE_DIR/state.XXXXXX")"
+    printf '#total %s\n' "$total_now" > "$tmp"
+
+    local d pid s ticks start k pct strikes alerted comm cmdline mins
+    local temp_now; temp_now="$(_cpu_temp_c || echo 0)"
+
+    for d in /proc/[0-9]*; do
+        pid="${d#/proc/}"
+        # Only this user's processes. Browser tabs live here, and a
+        # root process is not something a user session can kill
+        # anyway. The thermal backstop below covers everything else.
+        [ -O "$d" ] || continue
+        s="$(_proc_sample "$pid")" || continue
+        ticks="${s%% *}"; start="${s##* }"
+        # Key on PID:starttime so a recycled PID cannot inherit the
+        # strike count of a dead process.
+        k="${pid}:${start}"
+
+        pct=0
+        if [ "$scoring" = "true" ] && [ -n "${prev_ticks[$k]:-}" ]; then
+            pct=$(( (ticks - ${prev_ticks[$k]}) * 100 / elapsed ))
+        fi
+
+        strikes="${prev_strikes[$k]:-0}"
+        alerted="${prev_alerted[$k]:-0}"
+
+        # Diagnostics: anything meaningfully busy, plus one PID that
+        # can be pinned via CPU_HOG_TRACE_PID when chasing a bug.
+        if [ "$pct" -gt 50 ] || [ "$pid" = "${CPU_HOG_TRACE_PID:-}" ]; then
+            log_debug "pid=$pid pct=$pct strikes=$strikes" \
+                "prev=${prev_ticks[$k]:-NONE} elapsed=$elapsed"
+        fi
+
+        if [ "$pct" -ge "$HOG_PCT" ]; then
+            comm="$(cat "/proc/$pid/comm" 2>/dev/null || echo "?")"
+            cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)"
+            if printf '%s %s' "$comm" "$cmdline" \
+                 | grep -qE "$HOG_ALLOW_RE"; then
+                log_debug "allowlisted: $comm ($pid) at ${pct}%"
+                strikes=0
+            else
+                strikes=$(( strikes + 1 ))
+                # `alerted` stores the strike number we last alerted
+                # on, not a bare flag, so a process still burning
+                # HOG_RENOTIFY samples later warns again.
+                if [ "$strikes" -ge "$HOG_STRIKES" ] \
+                   && { [ "$alerted" -eq 0 ] \
+                        || [ "$(( strikes - alerted ))" \
+                             -ge "$HOG_RENOTIFY" ]; }; then
+                    mins=$(( strikes * elapsed / 100 / 60 ))
+                    # Floor at 1: "pegged for 0 min" reads as
+                    # a bug and undermines the alert.
+                    [ "$mins" -lt 1 ] && mins=1
+                    _alert_hog "$pid" "$start" "$comm" "$pct" \
+                        "$mins" "$temp_now"
+                    alerted="$strikes"
+                fi
+            fi
+        else
+            # Dropped below threshold: reset and RE-ARM, so a process
+            # that misbehaves twice alerts twice.
+            strikes=0
+            alerted=0
+        fi
+
+        if [ "$strikes" -gt 0 ] || [ "$pct" -gt 0 ]; then
+            printf '%s %s %s %s\n' "$k" "$ticks" "$strikes" "$alerted" >> "$tmp"
+        else
+            printf '%s %s 0 0\n' "$k" "$ticks" >> "$tmp"
+        fi
+    done
+
+    # ---- thermal backstop ----------------------------------------------
+    # Independent of the process check on purpose: it fires for heat
+    # sources the per-process pass cannot see (GPU, firmware, a root
+    # kworker), so the two together cover the space.
+    local ts="${prev_strikes[therm]:-0}" ta="${prev_alerted[therm]:-0}"
+    if [ -n "$temp_now" ] && [ "$temp_now" -ge "$THERM_C" ]; then
+        ts=$(( ts + 1 ))
+        if [ "$ts" -ge "$THERM_STRIKES" ] \
+           && { [ "$ta" -eq 0 ] \
+                || [ "$(( ts - ta ))" -ge "$HOG_RENOTIFY" ]; }; then
+            _alert_thermal temp "$temp_now" "$ts"
+            ta="$ts"
+        fi
+    else
+        ts=0; ta=0
+    fi
+    printf '#therm %s %s\n' "$ts" "$ta" >> "$tmp"
+
+    local fs="${prev_strikes[fan]:-0}" fa="${prev_alerted[fan]:-0}"
+    local rpm; rpm="$(_max_fan_rpm || echo 0)"
+    if [ "$rpm" -ge "$FAN_RPM" ]; then
+        fs=$(( fs + 1 ))
+        if [ "$fs" -ge "$FAN_STRIKES" ] \
+           && { [ "$fa" -eq 0 ] \
+                || [ "$(( fs - fa ))" -ge "$HOG_RENOTIFY" ]; }; then
+            _alert_thermal fan "$rpm" "$fs"
+            fa="$fs"
+        fi
+    else
+        fs=0; fa=0
+    fi
+    printf '#fan %s %s\n' "$fs" "$fa" >> "$tmp"
+
+    mv -f "$tmp" "$STATE_FILE"
+    log_debug "sample done: elapsed=${elapsed}j temp=${temp_now}C fan=${rpm}"
+}
+
+_print_status() {
+    printf 'cpu-hog-watch %s\n' "$SCRIPT_VERSION"
+    printf '  config      : %s\n' "$ENV_FILE"
+    printf '  state       : %s\n' "$STATE_FILE"
+    printf '  hog thresh  : %s%% of one core x %s samples\n' \
+        "$HOG_PCT" "$HOG_STRIKES"
+    printf '  thermal     : %sC x %s samples\n' "$THERM_C" "$THERM_STRIKES"
+    printf '  fan         : %s RPM x %s samples\n' "$FAN_RPM" "$FAN_STRIKES"
+    local t f
+    t="$(_cpu_temp_c || echo '')"
+    f="$(_max_fan_rpm || echo '')"
+    if [ -n "$t" ]; then
+        printf '  cpu temp now: %sC\n' "$t"
+    else
+        printf '  cpu temp now: unreadable\n'
+    fi
+    if [ -n "$f" ]; then
+        printf '  fan now     : %s RPM\n' "$f"
+    else
+        printf '  fan now     : unreadable\n'
+    fi
+    if [ -z "$t" ] && [ -z "$f" ]; then
+        printf '  sensors     : INACTIVE - no %s/%s on this host\n' \
+            "$THERM_HWMON" "$FAN_HWMON"
+        printf '                thermal backstop cannot fire; run\n'
+        printf '                `sensors` and set THERM_HWMON,\n'
+        printf '                THERM_LABEL and FAN_HWMON in the config\n'
+    elif [ -z "$t" ] || [ -z "$f" ]; then
+        printf '  sensors     : PARTIAL - one of the two is unreadable\n'
+    else
+        printf '  sensors     : ok (%s / %s)\n' "$THERM_HWMON" "$FAN_HWMON"
+    fi
+    if [ -r "$STATE_FILE" ]; then
+        printf '  tracked     : %s processes\n' \
+            "$(grep -cv '^#' "$STATE_FILE" 2>/dev/null || echo 0)"
+        printf '  striking    : \n'
+        awk '!/^#/ && $3 > 0 {print "    pid " $1 "  strikes " $3}' \
+            "$STATE_FILE" 2>/dev/null | head -10
+    else
+        printf '  tracked     : (no state yet - timer has not run)\n'
+    fi
+}
+
+main "$@"
