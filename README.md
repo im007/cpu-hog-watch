@@ -260,11 +260,11 @@ the notifier so the two cannot disagree about how heat is measured.
 
 [AGPL-3.0-or-later](LICENSE).
 
-**The obligation comes first: if you distribute a modified version — or
-run one as a network service — you must release your source under this
-same licence.** That network clause is what distinguishes AGPL from
-plain GPL, and it is the part most people miss.
+**Build on this and your source goes public under this same licence.**
+That holds whether you ship the modified version or expose it over a
+network — the network clause is what separates AGPL from plain GPL, and
+it is the part most people miss.
 
-**Everything else is permitted, commercial use included.** AGPL does not
-bar selling this or running it for profit. What it requires is
-reciprocity, not permission.
+**There is no private fork.** Whoever receives your version receives
+every right you received, including the source. Copyleft is the point,
+not a formality.
