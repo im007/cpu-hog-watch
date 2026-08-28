@@ -10,27 +10,6 @@ process separately and scales to *one core*, so that thread reads 99%
 instead of 6%. The blind spot widens as core counts rise: on 32 threads
 the same process is 3%.
 
-## Limitations
-
-Read these first — they decide whether this is useful to you.
-
-- **Linux with systemd and a graphical login only.** The alert is a
-  desktop notification, so there must be a session to show it in.
-- **It watches only your own processes.** A desktop session cannot
-  signal a root process, so a runaway system daemon raises no
-  per-process alert. The thermal backstop is what covers that case,
-  since heat is measured regardless of who owns the cause.
-- **The thermal backstop depends on hardware sensors.** Detection is
-  automatic and covers AMD, Intel and ARM, but a machine exposing none
-  of them gets no backstop. `cpu-hog-watch --detect` states plainly
-  what was found; `install.sh --verify` warns if nothing was.
-- **A generic ACPI zone is a fallback, not a measurement.** Where no
-  vendor sensor exists, detection falls back to `acpitz`, which may
-  report skin or chassis temperature rather than the CPU. Both
-  `--detect` and `--status` label it when this happens.
-- **It reacts, it does not prevent.** Nothing is throttled or capped;
-  you are told, and you decide.
-
 ## What you get
 
 - **A per-process watcher.** Alerts when one process holds a core for a
@@ -182,6 +161,27 @@ process holding a core for ten minutes is worth knowing about.
 | `cpu-hog-watch --help` | Usage |
 | `install.sh --verify` | Check a live install |
 | `install.sh --uninstall` | Remove it, keeping the config |
+
+## Limitations
+
+What this deliberately does not do.
+
+- **Linux with systemd and a graphical login only.** The alert is a
+  desktop notification, so there must be a session to show it in.
+- **It watches only your own processes.** A desktop session cannot
+  signal a root process, so a runaway system daemon raises no
+  per-process alert. The thermal backstop is what covers that case,
+  since heat is measured regardless of who owns the cause.
+- **The thermal backstop depends on hardware sensors.** Detection is
+  automatic and covers AMD, Intel and ARM, but a machine exposing none
+  of them gets no backstop. `cpu-hog-watch --detect` states plainly
+  what was found; `install.sh --verify` warns if nothing was.
+- **A generic ACPI zone is a fallback, not a measurement.** Where no
+  vendor sensor exists, detection falls back to `acpitz`, which may
+  report skin or chassis temperature rather than the CPU. Both
+  `--detect` and `--status` label it when this happens.
+- **It reacts, it does not prevent.** Nothing is throttled or capped;
+  you are told, and you decide.
 
 ## Troubleshooting
 
