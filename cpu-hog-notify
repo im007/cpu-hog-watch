@@ -41,6 +41,13 @@ readonly POPUP_TIMEOUT=21600
 # offering to kill - it is just the desktop doing its job.
 readonly KILL_OFFER_PCT=50
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+readonly SCRIPT_DIR
+# shellcheck source=cpu-hog-lib.sh
+if [ -r "$SCRIPT_DIR/cpu-hog-lib.sh" ]; then
+    . "$SCRIPT_DIR/cpu-hog-lib.sh"
+fi
+
 _log() {
     printf '[%s] [%s] [%s] %s\n' \
         "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$1" "$SCRIPT_NAME" "${*:2}" >&2
@@ -116,34 +123,6 @@ _top_procs() {
         comm="$(cat "/proc/$pid/comm" 2>/dev/null)" || continue
         printf '%s %s %s\n' "$pct" "$pid" "$comm"
     done | sort -rn | head -n "$want"
-}
-
-_cpu_temp_c() {
-    local h lbl inp
-    for h in /sys/class/hwmon/hwmon*; do
-        [ "$(cat "$h/name" 2>/dev/null)" = "k10temp" ] || continue
-        for lbl in "$h"/temp*_label; do
-            [ -e "$lbl" ] || continue
-            [ "$(cat "$lbl" 2>/dev/null)" = "Tctl" ] || continue
-            inp="${lbl%_label}_input"
-            [ -r "$inp" ] && printf '%s\n' "$(( $(cat "$inp") / 1000 ))"
-            return 0
-        done
-    done
-    return 1
-}
-
-_max_fan_rpm() {
-    local h f max=0 v
-    for h in /sys/class/hwmon/hwmon*; do
-        [ "$(cat "$h/name" 2>/dev/null)" = "cros_ec" ] || continue
-        for f in "$h"/fan*_input; do
-            [ -r "$f" ] || continue
-            v="$(cat "$f" 2>/dev/null)" || continue
-            [ -n "$v" ] && [ "$v" -gt "$max" ] && max="$v"
-        done
-    done
-    [ "$max" -gt 0 ] && printf '%s\n' "$max"
 }
 
 # ==============================================================================

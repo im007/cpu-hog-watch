@@ -32,7 +32,8 @@ say() { printf '  %s\n' "$*"; }
 verify() {
     local rc=0
     printf '\ncpu-hog-watch verification\n'
-    for f in "$BIN/cpu-hog-watch" "$BIN/cpu-hog-notify"; do
+    for f in "$BIN/cpu-hog-watch" "$BIN/cpu-hog-notify" \
+             "$BIN/cpu-hog-lib.sh"; do
         if [ -x "$f" ]; then say "OK   $f"
         else say "FAIL $f"; rc=1; fi
     done
@@ -54,13 +55,19 @@ verify() {
     # The thermal backstop reads named hwmon sensors. If this host has
     # neither, it can never fire - say so at install time rather than
     # letting someone believe they have a safety net they do not.
-    if "$BIN/cpu-hog-watch" --status 2>/dev/null | grep -q "INACTIVE"; then
-        say "WARN thermal backstop INACTIVE - sensors not found"
-        say "     the per-process watcher is unaffected"
-        say "     run 'cpu-hog-watch --status' for what to set"
-    else
-        say "OK   thermal backstop has sensors"
-    fi
+    local sens
+    sens="$("$BIN/cpu-hog-watch" --status 2>/dev/null | grep 'sensors ')"
+    case "$sens" in
+        *"NONE FOUND"*)
+            say "WARN no thermal sensors - backstop cannot fire"
+            say "     the per-process watcher is unaffected"
+            say "     run 'cpu-hog-watch --detect' for detail" ;;
+        *PARTIAL*)
+            say "WARN only one thermal sensor found"
+            say "     run 'cpu-hog-watch --detect' for detail" ;;
+        *)
+            say "OK  ${sens# *sensors     : }" ;;
+    esac
     printf '\n'
     systemctl --user list-timers cpu-hog-watch.timer \
         --no-pager 2>/dev/null | head -3
@@ -70,7 +77,8 @@ verify() {
 uninstall() {
     systemctl --user disable --now cpu-hog-watch.timer 2>/dev/null || true
     rm -f "$UNITS/cpu-hog-watch.service" "$UNITS/cpu-hog-watch.timer"
-    rm -f "$BIN/cpu-hog-watch" "$BIN/cpu-hog-notify"
+    rm -f "$BIN/cpu-hog-watch" "$BIN/cpu-hog-notify" \
+          "$BIN/cpu-hog-lib.sh"
     systemctl --user daemon-reload
     say "removed (config left at $ENVF)"
     exit 0
@@ -89,6 +97,9 @@ mkdir -p "$BIN" "$UNITS"
 # Symlink rather than copy so a git pull updates the live tool.
 ln -sfn "$SRC/cpu-hog-watch"  "$BIN/cpu-hog-watch"
 ln -sfn "$SRC/cpu-hog-notify" "$BIN/cpu-hog-notify"
+# Both scripts source the library from their own directory, so it has
+# to sit alongside them in $BIN, not only in the clone.
+ln -sfn "$SRC/cpu-hog-lib.sh" "$BIN/cpu-hog-lib.sh"
 say "linked binaries into $BIN"
 
 if [ ! -e "$ENVF" ]; then
