@@ -1,0 +1,13 @@
+[Unit]
+Description=Sample per-process CPU every minute for cpu-hog-watch
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60s
+AccuracySec=5s
+# Deliberately NOT Persistent: a missed window while suspended has no
+# samples to score, and replaying it would only produce a bogus delta.
+Persistent=false
+
+[Install]
+WantedBy=timers.target

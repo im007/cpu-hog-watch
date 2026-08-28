@@ -1,0 +1,19 @@
+[Unit]
+Description=Watch for a process saturating a CPU core, and for pinned fans
+Documentation=man:proc(5)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/cpu-hog-watch
+# The watcher must never become the thing it is watching.
+Nice=10
+CPUQuota=50%
+# Read-only view of the system is all it needs to observe. The kill
+# path runs in the DETACHED helper, not here, so this unit stays inert.
+ProtectSystem=strict
+# %t is XDG_RUNTIME_DIR. Without this, strict makes /run
+# read-only and the state file cannot be written.
+ReadWritePaths=%t
+ProtectHome=read-only
+PrivateTmp=false
+NoNewPrivileges=true

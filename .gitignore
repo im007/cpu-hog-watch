@@ -1,0 +1,3 @@
+# Runtime state lives in $XDG_RUNTIME_DIR, never in the repo.
+*.log
+*.state
