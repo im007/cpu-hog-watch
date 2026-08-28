@@ -25,7 +25,7 @@
 #   USER timer, not a system one, so notify-send can reach the Plasma
 #   session bus. A system unit has no session bus and notifies nobody.
 #
-# Usage: cpu-hog-watch [--dry-run] [--status] [--help]
+# Usage: cpu-hog-watch [--dry-run] [--status] [--detect] [--help]
 #
 # Exit Codes:
 #   0 - Success
@@ -63,15 +63,13 @@ THERM_STRIKES="${THERM_STRIKES:-5}"
 FAN_RPM="${FAN_RPM:-4500}"
 FAN_STRIKES="${FAN_STRIKES:-15}"
 
-# Which hwmon sensors carry package temperature and fan speed. The
-# defaults are AMD (k10temp/Tctl) and the ChromeOS EC that Framework
-# and Chromebooks expose. Intel reports package temp through
-# `coretemp` with the label "Package id 0"; many laptops publish fans
-# through `thinkpad`, `dell_smm`, `asus_wmi` or `acpitz` instead.
-# `sensors` lists what this machine actually has.
-THERM_HWMON="${THERM_HWMON:-k10temp}"
-THERM_LABEL="${THERM_LABEL:-Tctl}"
-FAN_HWMON="${FAN_HWMON:-cros_ec}"
+# Sensor selection. "auto" walks a probe list covering AMD, Intel and
+# ARM for temperature, and accepts any hwmon exposing a fan for speed.
+# Set an explicit driver name only to override that choice.
+# `cpu-hog-watch --detect` shows what was found and what was picked.
+THERM_HWMON="${THERM_HWMON:-auto}"
+THERM_LABEL="${THERM_LABEL:-}"
+FAN_HWMON="${FAN_HWMON:-auto}"
 
 # Processes that legitimately peg a core. Extended regex, matched
 # against both comm and full cmdline. Deliberately does NOT include
@@ -98,6 +96,14 @@ ENV_FILE="${CPU_HOG_ENV_FILE:-$HOME/.config/cpu-hog-watch.env}"
 STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}/cpu-hog-watch"
 STATE_FILE="$STATE_DIR/state"
 NOTIFY_HELPER="$SCRIPT_DIR/cpu-hog-notify"
+LIB="$SCRIPT_DIR/cpu-hog-lib.sh"
+
+# Sensor discovery is shared with the notifier so the two cannot drift
+# apart on how heat is measured.
+# shellcheck source=cpu-hog-lib.sh
+if [ -r "$LIB" ]; then . "$LIB"; else
+    echo "missing library: $LIB" >&2; exit 3
+fi
 
 # ==============================================================================
 # Logging - stderr only. A user timer's stderr lands in the journal:
@@ -151,48 +157,6 @@ _total_jiffies() {
     local sum=0 i
     for i in "${f[@]:1}"; do sum=$(( sum + i )); done
     printf '%s\n' "$sum"
-}
-
-# Resolve an hwmon path by its name file. hwmon NUMBERING IS NOT
-# STABLE ACROSS BOOTS - k10temp was hwmon12 today and may not be
-# tomorrow. Hardcoding the number is a bug that hides for weeks.
-_hwmon_by_name() {
-    local want="$1" h
-    for h in /sys/class/hwmon/hwmon*; do
-        if [ "$(cat "$h/name" 2>/dev/null)" = "$want" ]; then
-            printf '%s\n' "$h"; return 0
-        fi
-    done
-    return 1
-}
-
-# Package temperature in whole degrees C, or empty.
-_cpu_temp_c() {
-    local h lbl
-    h="$(_hwmon_by_name "$THERM_HWMON")" || return 1
-    for lbl in "$h"/temp*_label; do
-        [ -e "$lbl" ] || continue
-        if [ "$(cat "$lbl" 2>/dev/null)" = "$THERM_LABEL" ]; then
-            local inp="${lbl%_label}_input"
-            [ -r "$inp" ] || return 1
-            printf '%s\n' "$(( $(cat "$inp") / 1000 ))"
-            return 0
-        fi
-    done
-    return 1
-}
-
-# Highest fan RPM reported by the EC, or empty.
-_max_fan_rpm() {
-    local h f max=0 v
-    h="$(_hwmon_by_name "$FAN_HWMON")" || return 1
-    for f in "$h"/fan*_input; do
-        [ -r "$f" ] || continue
-        v="$(cat "$f" 2>/dev/null)" || continue
-        [ -n "$v" ] && [ "$v" -gt "$max" ] && max="$v"
-    done
-    [ "$max" -gt 0 ] || return 1
-    printf '%s\n' "$max"
 }
 
 # ==============================================================================
@@ -264,6 +228,7 @@ main() {
         case "$1" in
             --dry-run) DRY_RUN=true ;;
             --status)  _print_status; exit 0 ;;
+            --detect)  _print_detect; exit 0 ;;
             -h|--help) usage 0 ;;
             *) echo "unknown argument: $1" >&2; usage 2 ;;
         esac
@@ -442,6 +407,68 @@ main() {
     log_debug "sample done: elapsed=${elapsed}j temp=${temp_now}C fan=${rpm}"
 }
 
+_print_detect() {
+    local src drv lbl path rpm who n h f found
+    printf 'cpu-hog-watch sensor detection\n\n'
+
+    printf 'CPU temperature\n'
+    if src="$(_find_temp_source)"; then
+        path="${src%%|*}"; drv="$(printf '%s' "$src" | cut -d'|' -f2)"
+        lbl="$(printf '%s' "$src" | cut -d'|' -f3)"
+        printf '  using   : %s%s\n' "$(_hwmon_real_name "$drv")" \
+            "${lbl:+ / $lbl}"
+        printf '  path    : %s\n' "$path"
+        printf '  reads   : %s C\n' "$(( $(cat "$path") / 1000 ))"
+        if _therm_is_generic "$drv"; then
+            printf '  WARNING : this is a generic ACPI zone. It may\n'
+            printf '            report skin or chassis temperature\n'
+            printf '            rather than the CPU. Check it against\n'
+            printf '            `sensors` under load before trusting\n'
+            printf '            THERM_C, or set THERM_HWMON yourself.\n'
+        fi
+    else
+        printf '  using   : NOTHING FOUND\n'
+        printf '  effect  : the thermal backstop cannot fire\n'
+    fi
+    printf '  probes  : (first match wins)\n'
+    for entry in "${CPU_HOG_THERM_PROBES[@]}"; do
+        drv="${entry%%|*}"; lbl="${entry#*|}"
+        if _temp_input_for "$drv" "$lbl" >/dev/null 2>&1; then
+            found="available"
+        elif _hwmon_by_name "$drv" >/dev/null 2>&1; then
+            found="driver present, label absent"
+        else
+            found="-"
+        fi
+        printf '    %-24s %s\n' "$drv${lbl:+ / $lbl}" "$found"
+        unset found
+    done
+
+    printf '\nFan speed\n'
+    if src="$(_find_fan_source)"; then
+        rpm="${src%%|*}"; who="${src#*|}"
+        printf '  using   : %s (%s RPM)\n' "$who" "$rpm"
+        printf '  note    : the fastest fan on the machine; any hwmon\n'
+        printf '            exposing fan*_input qualifies, so this\n'
+        printf '            needs no driver list.\n' 
+    else
+        printf '  using   : NOTHING FOUND\n'
+        printf '  effect  : the fan backstop cannot fire\n'
+    fi
+    printf '  fan controllers seen:\n'
+    found=""
+    for h in /sys/class/hwmon/hwmon*; do
+        n="$(cat "$h/name" 2>/dev/null)" || continue
+        for f in "$h"/fan*_input; do
+            [ -r "$f" ] || continue
+            printf '    %-24s %s RPM\n' \
+                "$n/$(basename "$f" _input)" "$(cat "$f" 2>/dev/null)"
+            found=y
+        done
+    done
+    [ -n "$found" ] || printf '    (none on this machine)\n'
+}
+
 _print_status() {
     printf 'cpu-hog-watch %s\n' "$SCRIPT_VERSION"
     printf '  config      : %s\n' "$ENV_FILE"
@@ -464,15 +491,20 @@ _print_status() {
         printf '  fan now     : unreadable\n'
     fi
     if [ -z "$t" ] && [ -z "$f" ]; then
-        printf '  sensors     : INACTIVE - no %s/%s on this host\n' \
-            "$THERM_HWMON" "$FAN_HWMON"
-        printf '                thermal backstop cannot fire; run\n'
-        printf '                `sensors` and set THERM_HWMON,\n'
-        printf '                THERM_LABEL and FAN_HWMON in the config\n'
+        printf '  sensors     : NONE FOUND - thermal backstop cannot\n'
+        printf '                fire. Run `cpu-hog-watch --detect`.\n'
     elif [ -z "$t" ] || [ -z "$f" ]; then
-        printf '  sensors     : PARTIAL - one of the two is unreadable\n'
+        printf '  sensors     : PARTIAL - see `cpu-hog-watch --detect`\n'
     else
-        printf '  sensors     : ok (%s / %s)\n' "$THERM_HWMON" "$FAN_HWMON"
+        local ts fs tdrv
+        ts="$(_find_temp_source)"; fs="$(_find_fan_source)"
+        tdrv="$(printf '%s' "$ts" | cut -d'|' -f2)"
+        printf '  sensors     : %s / %s\n' \
+            "$(_hwmon_real_name "$tdrv")" "${fs#*|}"
+        if _therm_is_generic "$tdrv"; then
+            printf '                (temp source is a generic ACPI\n'
+            printf '                 zone - see --detect)\n'
+        fi
     fi
     if [ -r "$STATE_FILE" ]; then
         printf '  tracked     : %s processes\n' \
