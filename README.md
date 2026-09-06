@@ -1,5 +1,13 @@
 # cpu-hog-watch
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/banner-on-dark.svg">
+    <img src="assets/banner-on-light.svg" width="720"
+         alt="A boar watching a load trace; one bar has spiked and been cut off.">
+  </picture>
+</p>
+
 Desktop alerts for Linux when a single process pegs a CPU core, with a
 button to stop it. Built for people whose laptop fans spin up for hours
 because one runaway browser tab is burning a thread.
@@ -57,6 +65,12 @@ To remove it (the config file is left alone):
 ```
 ./install.sh --uninstall
 ```
+
+The installer also places the mark in your icon theme and a `NoDisplay`
+desktop entry beside it, so alerts carry the logo and keep it once the
+notification list groups them. `cpu-hog-notify` falls back to a stock
+freedesktop icon when the mark is absent, so running straight from a checkout
+still shows an icon rather than none.
 
 ## Sensor detection
 
