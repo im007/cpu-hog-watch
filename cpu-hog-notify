@@ -125,16 +125,23 @@ _total_jiffies() {
 # which is how "100 ps" ends up at the top of an alert.
 _top_procs() {
     local want="${1:-3}" self=$$
-    local -A t0
+    local -A t0 own
     local d pid ncpu tj0 tj1 elapsed delta pct comm
     ncpu="$(grep -c '^cpu[0-9]' /proc/stat)"
     [ "$ncpu" -ge 1 ] || ncpu=1
 
     tj0="$(_total_jiffies)"
+    # EVERY process, not just this user's. The thermal backstop exists for heat
+    # the per-process pass cannot see — a GPU daemon, firmware, something
+    # running as root — so a list restricted to our own processes names the
+    # innocent and hides the cause. /proc/PID/stat is world-readable, and
+    # ownership is recorded per pid so the display can mark what cannot be
+    # killed rather than pretending it can.
     for d in /proc/[0-9]*; do
         pid="${d#/proc/}"
         [ "$pid" = "$self" ] && continue
-        [ -O "$d" ] || continue
+        [ -r "$d/stat" ] || continue
+        if [ -O "$d" ]; then own[$pid]=1; else own[$pid]=0; fi
         t0[$pid]="$(_ticks_of "$pid")" 2>/dev/null || true
     done
 
@@ -150,7 +157,7 @@ _top_procs() {
         pct=$(( (delta - ${t0[$pid]}) * 100 / elapsed ))
         [ "$pct" -gt 0 ] || continue
         comm="$(cat "/proc/$pid/comm" 2>/dev/null)" || continue
-        printf '%s %s %s\n' "$pct" "$pid" "$comm"
+        printf '%s %s %s %s\n' "$pct" "$pid" "${own[$pid]:-0}" "$comm"
     done | sort -rn | head -n "$want"
 }
 
@@ -362,13 +369,17 @@ _do_thermal() {
     top="$(_top_procs 3)"
     if [ -n "$top" ]; then
         body="$body"$'\n\n'"<b>Top CPU users</b>"
-        while read -r tp tpid tcomm; do
+        while read -r tp tpid town tcomm; do
             [ -n "$tp" ] || continue
-            body="$body"$'\n'"${tp}%  ${tcomm}"
+            if [ "$town" = 1 ]; then
+                body="$body"$'\n'"${tp}%  ${tcomm}"
+            else
+                body="$body"$'\n'"${tp}%  ${tcomm} (not yours)"
+            fi
         done <<< "$top"
     fi
 
-    read -r tp tpid tcomm <<< "$(printf '%s\n' "$top" | head -1)"
+    read -r tp tpid town tcomm <<< "$(printf '%s\n' "$top" | head -1)"
 
     args=(--app-name="$APP_NAME" -u normal -t 0 -i "$ICON"
       --hint="$DESKTOP_HINT")
@@ -376,7 +387,10 @@ _do_thermal() {
     # Only offer a kill when one process is clearly to blame. A
     # thermal alert with no dominant process is informational: there
     # is nothing sensible to point a kill button at.
-    if [ -n "${tp:-}" ] && [ "$tp" -ge "$KILL_OFFER_PCT" ] \
+    # A kill is offered only for a process this user owns. Offering it for a
+    # root process would fail the ownership check in _safe_kill and read as a
+    # broken button rather than a refusal.
+    if [ "${town:-0}" = 1 ] && [ -n "${tp:-}" ] && [ "$tp" -ge "$KILL_OFFER_PCT" ] \
        && [ -d "/proc/$tpid" ]; then
         start="$(_starttime_of "$tpid")" || start=""
         if [ -n "$start" ]; then
