@@ -1,5 +1,13 @@
 # cpu-hog-watch
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/banner-on-dark.svg">
+    <img src="assets/banner-on-light.svg" width="720"
+         alt="A boar watching a load trace; one bar has spiked and been cut off.">
+  </picture>
+</p>
+
 Desktop alerts for Linux when a single process pegs a CPU core, with a
 button to stop it. Built for people whose laptop fans spin up for hours
 because one runaway browser tab is burning a thread.
