@@ -185,6 +185,11 @@ _still_same() {
 # exited and had its PID recycled onto something important.
 _safe_kill() {
     local pid="$1" want_start="$2" comm="$3" now_start
+    # Decided NOW, while the process still exists. The Chromium test reads
+    # /proc/PID/cmdline, which is gone by the time the kill has succeeded, so
+    # asking afterwards silently reports "not a tab" for every Chrome tab.
+    local was_tab=false
+    _is_browser_tab "$comm" "$pid" && was_tab=true
 
     if _is_dead "$pid"; then
         notify-send --app-name="$APP_NAME" -u low -i dialog-information \
@@ -234,9 +239,13 @@ _safe_kill() {
         return 4
     fi
 
+    # Only a browser TAB shows a Restore button. Saying it for every kill —
+    # node, python, the browser itself — is the same false reassurance the
+    # tab/parent split fixed above, in the message that reports success.
+    local done_msg="PID $pid is gone."
+    [ "$was_tab" = true ] && done_msg="$done_msg The tab shows a Restore button."
     notify-send --app-name="$APP_NAME" -u low -i dialog-information \
-        "Stopped $comm" \
-        "PID $pid is gone. A killed tab shows a Restore button."
+        "Stopped $comm" "$done_msg"
     _log INFO "pid $pid killed"
     return 0
 }

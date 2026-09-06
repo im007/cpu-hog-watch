@@ -334,8 +334,22 @@ main() {
         if [ "$pct" -ge "$HOG_PCT" ]; then
             comm="$(cat "/proc/$pid/comm" 2>/dev/null || echo "?")"
             cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)"
-            if printf '%s %s' "$comm" "$cmdline" \
-                 | grep -qE "$HOG_ALLOW_RE"; then
+            # Match the PROGRAM, not the whole command line. Scanning every
+            # argument unanchored meant a runaway was silenced by any path or
+            # URL containing an allowlisted word: a browser tab on
+            # ".../how-to-make-bread" matched "make", and a node process under
+            # ~/src/mockingbird/ matched "mock". Those are exactly the hogs
+            # this exists to catch, and they never alerted.
+            #
+            # Haystack is comm plus the basenames of argv[0] and argv[1] —
+            # enough for "go build" and for wrappers like
+            # "python3 /usr/bin/dnf", without scanning user data.
+            set -- $cmdline
+            _hay=" $comm ${1##*/} ${2##*/} "
+            # Whitespace-anchored so entries match whole tokens: "xz" no
+            # longer matches "xzcompress-bench.py".
+            if printf '%s' "$_hay" \
+                 | grep -qE "[[:space:]]($HOG_ALLOW_RE)[[:space:]]"; then
                 log_debug "allowlisted: $comm ($pid) at ${pct}%"
                 strikes=0
             else
