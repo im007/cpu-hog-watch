@@ -1,11 +1,14 @@
-# cpu-hog-watch
+<h1 align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/mark-amber.svg">
+    <img src="assets/mark-rust.svg" width="132" alt="">
+  </picture>
+  <br>
+  cpu-hog-watch
+</h1>
 
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/banner-on-dark.svg">
-    <img src="assets/banner-on-light.svg" width="720"
-         alt="A boar watching a load trace; one bar has spiked and been cut off.">
-  </picture>
+  A boar whose bristles are a CPU load trace, one spike pegged at the centre.
 </p>
 
 Desktop alerts for Linux when a single process pegs a CPU core, with a
@@ -95,6 +98,14 @@ and the fastest one is used.
 
 Override either with `THERM_HWMON`, `THERM_LABEL` and `FAN_HWMON` if
 detection picks wrong.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/banner-on-dark.svg">
+    <img src="assets/banner-on-light.svg" width="720"
+         alt="A boar watching a load trace; one bar has spiked and been cut off.">
+  </picture>
+</p>
 
 ## What an alert looks like
 
