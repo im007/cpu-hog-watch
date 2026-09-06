@@ -47,11 +47,19 @@ readonly APP_ID="io.github.im007.cpu-hog-watch"
 
 # Falls back to a stock freedesktop name when the mark is not installed, so a
 # clone run straight from a checkout still shows an icon rather than none.
-if [ -r "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps/$APP_ID.svg" ]; then
-    readonly ICON="$APP_ID"
-else
-    readonly ICON="utilities-system-monitor"
-fi
+# Passed as a PATH, not as the app-id name. The header icon already comes from
+# the .desktop entry via the hint below; when -i names that same icon the
+# daemon shows only the header and drops the large image. A path keeps both:
+# the mark in the header, and the mark again as the notification's own image.
+_icon() {
+    local d="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor" c
+    for c in "$d/scalable/apps/$APP_ID.svg" "$d/128x128/apps/$APP_ID.png"; do
+        [ -r "$c" ] && { printf '%s' "$c"; return 0; }
+    done
+    printf 'utilities-system-monitor'
+}
+ICON="$(_icon)"
+readonly ICON
 # Binds the popup to the .desktop entry, which is what supplies the small icon
 # in the notification header and keeps it once notifications are grouped.
 readonly DESKTOP_HINT="string:desktop-entry:$APP_ID"
