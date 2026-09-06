@@ -128,10 +128,20 @@ hot:
 >
 > `Stop node`  `Leave it`
 
+The list covers **every** process on the machine, not only yours, because the
+whole point of the backstop is heat the per-process pass cannot see. Anything
+you do not own is marked:
+
+> **Top CPU users**
+> 88% mysqld (not yours)
+> 12% node
+> 4% Isolated Web Co
+
 It offers a kill button only when one process is clearly to blame — the
-top process must be at **50%** of a core or more. Below that the heat has
-no single owner and there is nothing sensible to point a button at, so
-the alert is informational.
+top process must be at **50%** of a core or more, **and** be one of yours.
+Below that, or when the cause is a process you cannot signal, the alert is
+informational: it still names the culprit, which is what you need in order
+to do something about it.
 
 ## Stopping a browser tab
 
@@ -209,8 +219,10 @@ What this deliberately does not do.
   desktop notification, so there must be a session to show it in.
 - **It watches only your own processes.** A desktop session cannot
   signal a root process, so a runaway system daemon raises no
-  per-process alert. The thermal backstop is what covers that case,
-  since heat is measured regardless of who owns the cause.
+  per-process alert. The thermal backstop covers that case: heat is
+  measured regardless of who owns the cause, and its **Top CPU users**
+  list reads every process on the machine, so it can name a root daemon
+  even though it cannot offer to stop one.
 - **The thermal backstop depends on hardware sensors.** Detection is
   automatic and covers AMD, Intel and ARM, but a machine exposing none
   of them gets no backstop. `cpu-hog-watch --detect` states plainly
