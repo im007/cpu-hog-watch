@@ -7,10 +7,6 @@
   cpu-hog-watch
 </h1>
 
-<p align="center">
-  A boar whose bristles are a CPU load trace, one spike pegged at the centre.
-</p>
-
 Desktop alerts for Linux when a single process pegs a CPU core, with a
 button to stop it. Built for people whose laptop fans spin up for hours
 because one runaway browser tab is burning a thread.
@@ -111,27 +107,31 @@ detection picks wrong.
 
 A single process holding a core gets a popup naming it:
 
-> **cpu-hog-drill · 99% of a core**
+> **node · 99% of a core**
 > Held for **12 min** — PID 331948
 > CPU 94 °C · fan 5228 RPM
 >
 > `Stop it`  `Leave it`
 
-Heat with no single process behind it gets the backstop alert, which
-lists what is actually running hot:
+The thermal backstop is separate and fires on sustained heat or fan
+speed whatever the cause, including sources the per-process pass cannot
+see — a GPU, firmware, a root daemon. It lists what is actually running
+hot:
 
 > **Fan pinned at 5228 RPM**
 > Sustained **~15 min** · CPU 94 °C
 >
 > **Top CPU users**
-> 91% cpu-hog-drill
+> 91% node
 > 38% Isolated Web Co
 > 37% zen-bin
 >
-> `Stop cpu-hog-drill`  `Leave it`
+> `Stop node`  `Leave it`
 
-The backstop offers a kill button only when one process is clearly to
-blame. Otherwise there is nothing sensible to point it at.
+It offers a kill button only when one process is clearly to blame — the
+top process must be at **50%** of a core or more. Below that the heat has
+no single owner and there is nothing sensible to point a button at, so
+the alert is informational.
 
 ## Stopping a browser tab
 
