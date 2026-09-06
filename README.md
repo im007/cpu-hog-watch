@@ -135,9 +135,23 @@ the alert is informational.
 
 ## Stopping a browser tab
 
-Stopping a browser content process ends **that tab**, not the browser.
+Stopping a browser **content** process ends **that tab**, not the browser.
 Your session, your window and your other tabs keep running, and the dead
 tab shows a **Restore This Tab** button.
+
+The browser's own process is a different matter, and the alert says so.
+A tab alert reads *"Kills this browser tab only, browser keeps running"*;
+the browser itself gets *"Browser itself - this closes the entire
+browser"*, and its button reads **Close browser** rather than **Stop
+it**. The distinction is drawn from the process itself:
+
+| Family | Tab | Browser itself |
+|---|---|---|
+| Firefox, Zen, LibreWolf | `Isolated Web Co`, `Web Content`, `Privileged Cont` | `firefox`, `zen-bin`, `librewolf` |
+| Chromium, Chrome, Brave | `chrome` **with `--type=renderer`** | `chrome` without it |
+
+Chromium gives every process the same `comm`, parent included, so only the
+command line separates a renderer from the browser.
 
 The unit is the content process rather than the tab itself. Under
 Firefox's Fission — its site-isolation model — one process serves one

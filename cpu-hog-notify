@@ -245,9 +245,41 @@ _safe_kill() {
 # Popups
 # ==============================================================================
 
-_is_browser() {
+# Is this a browser CONTENT process — one tab — or the browser itself?
+#
+# Getting this backwards is not cosmetic. The popup promises the kill ends one
+# tab, so matching the parent process makes it lie and closes the whole
+# browser, losing every tab. The earlier matcher globbed *zen*, *firefox* and
+# *chrome*, all of which match the parent: zen-bin, firefox and chrome are the
+# comm values of the browsers themselves.
+_is_browser_tab() {
     case "$1" in
-        *Web\ Co*|*Isolated*|*zen*|*firefox*|*chrome*|*chromium*)
+        # Firefox family (Firefox, Zen, LibreWolf, Floorp). Content children
+        # carry their own comm; the parent is firefox / zen-bin / librewolf.
+        # Content processes only. WebExtensions hosts add-ons and
+        # Isolated Servi* is a service worker — killing either is not
+        # "this tab only", so they get no message rather than a wrong one.
+        "Isolated Web Co"*|"Web Content"*|"Privileged Cont"*)
+            return 0 ;;
+    esac
+    # Chromium family. Every process shares the comm "chrome", the parent
+    # included, so only the command line distinguishes a renderer.
+    case "$1" in
+        chrome|chromium|chromium-browse|brave|msedge|vivaldi-bin|opera)
+            case "$(tr '\0' ' ' < "/proc/$2/cmdline" 2>/dev/null)" in
+                *--type=renderer*) return 0 ;;
+            esac
+            return 1 ;;
+    esac
+    return 1
+}
+
+# The browser itself. Killing this closes every tab, so say so plainly rather
+# than offering the reassurance meant for a single content process.
+_is_browser_parent() {
+    case "$1" in
+        firefox|zen|zen-bin|librewolf|floorp|waterfox|\
+        chrome|chromium|chromium-browse|brave|msedge|vivaldi-bin|opera)
             return 0 ;;
     esac
     return 1
@@ -267,16 +299,24 @@ _do_hog() {
         body="$body"$'\n'"CPU ${temp} °C"
         [ -n "$fan" ] && body="$body · fan ${fan} RPM"
     fi
-    if _is_browser "$comm"; then
-        body="$body"$'\n\n'"Browser tab. Killing ends this tab only —"
-        body="$body"$'\n'"your session and other tabs keep running."
+    # Kept to one line each, and parallel. The button already says what the
+    # action is ("Stop it" vs "Close browser"), so the body only has to say
+    # what the target is.
+    if _is_browser_tab "$comm" "$pid"; then
+        body="$body"$'\n\n'"Kills this browser tab only, browser keeps running."
+    elif _is_browser_parent "$comm"; then
+        body="$body"$'\n\n'"<b>Browser itself - this closes the entire browser.</b>"
     fi
 
     args=(--app-name="$APP_NAME" -u critical -t 0)
     args+=(-i "$ICON" --hint="$DESKTOP_HINT")
 
     if [ "$button" = "true" ]; then
-        args+=(-A "kill=Stop it")
+        if _is_browser_parent "$comm"; then
+            args+=(-A "kill=Close browser")
+        else
+            args+=(-A "kill=Stop it")
+        fi
         args+=(-A "ignore=Leave it")
         action="$(timeout "$POPUP_TIMEOUT" \
             notify-send "${args[@]}" "$title" "$body" 2>/dev/null)" \
