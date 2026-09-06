@@ -7,10 +7,6 @@
   cpu-hog-watch
 </h1>
 
-<p align="center">
-  A boar whose bristles are a CPU load trace, one spike pegged at the centre.
-</p>
-
 Desktop alerts for Linux when a single process pegs a CPU core, with a
 button to stop it. Built for people whose laptop fans spin up for hours
 because one runaway browser tab is burning a thread.
