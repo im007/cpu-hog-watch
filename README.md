@@ -66,6 +66,12 @@ To remove it (the config file is left alone):
 ./install.sh --uninstall
 ```
 
+The installer also places the mark in your icon theme and a `NoDisplay`
+desktop entry beside it, so alerts carry the logo and keep it once the
+notification list groups them. `cpu-hog-notify` falls back to a stock
+freedesktop icon when the mark is absent, so running straight from a checkout
+still shows an icon rather than none.
+
 ## Sensor detection
 
 Temperature is probed in order, first match winning:

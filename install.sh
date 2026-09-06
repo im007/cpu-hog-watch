@@ -26,6 +26,9 @@ readonly SRC
 readonly BIN="$HOME/.local/bin"
 readonly UNITS="$HOME/.config/systemd/user"
 readonly ENVF="$HOME/.config/cpu-hog-watch.env"
+readonly DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
+readonly ICONS="$DATA/icons/hicolor"
+readonly APPS="$DATA/applications"
 
 say() { printf '  %s\n' "$*"; }
 
@@ -37,6 +40,16 @@ verify() {
         if [ -x "$f" ]; then say "OK   $f"
         else say "FAIL $f"; rc=1; fi
     done
+    if [ -r "$ICONS/scalable/apps/cpu-hog-watch.svg" ]; then
+        say "OK   $ICONS/scalable/apps/cpu-hog-watch.svg"
+    else
+        say "WARN icon not installed - notifications fall back to a stock icon"
+    fi
+    if [ -r "$APPS/cpu-hog-watch.desktop" ]; then
+        say "OK   $APPS/cpu-hog-watch.desktop"
+    else
+        say "WARN desktop entry missing - notifications may lose the icon"
+    fi
     if [ -r "$ENVF" ]; then say "OK   $ENVF"
     else say "WARN $ENVF (defaults in use)"; fi
     if systemctl --user is-enabled cpu-hog-watch.timer >/dev/null 2>&1; then
@@ -79,6 +92,11 @@ uninstall() {
     rm -f "$UNITS/cpu-hog-watch.service" "$UNITS/cpu-hog-watch.timer"
     rm -f "$BIN/cpu-hog-watch" "$BIN/cpu-hog-notify" \
           "$BIN/cpu-hog-lib.sh"
+    rm -f "$ICONS/scalable/apps/cpu-hog-watch.svg" \
+          "$APPS/cpu-hog-watch.desktop"
+    for sz in 16 32 48 64 128 256 512; do
+        rm -f "$ICONS/${sz}x${sz}/apps/cpu-hog-watch.png"
+    done
     systemctl --user daemon-reload
     say "removed (config left at $ENVF)"
     exit 0
@@ -108,6 +126,28 @@ if [ ! -e "$ENVF" ]; then
 else
     say "kept existing $ENVF"
 fi
+
+# Icon and desktop entry. The entry is NoDisplay - this is a background
+# timer, not something to launch - but it gives the notification daemon a
+# .desktop to bind the popup to, which is what keeps the icon and the app
+# name attached once notifications are grouped.
+install -d "$ICONS/scalable/apps" "$APPS"
+install -m 644 "$SRC/assets/mark-amber.svg" \
+        "$ICONS/scalable/apps/cpu-hog-watch.svg"
+for sz in 16 32 48 64 128 256 512; do
+    [ -r "$SRC/assets/icon-$sz.png" ] || continue
+    install -d "$ICONS/${sz}x${sz}/apps"
+    install -m 644 "$SRC/assets/icon-$sz.png" \
+            "$ICONS/${sz}x${sz}/apps/cpu-hog-watch.png"
+done
+install -m 644 "$SRC/cpu-hog-watch.desktop" "$APPS/cpu-hog-watch.desktop"
+# Best-effort: the caches are an optimisation, and a stale one only delays
+# the icon appearing. Never fail the install over them.
+command -v gtk-update-icon-cache >/dev/null 2>&1 \
+    && gtk-update-icon-cache -qtf "$ICONS" 2>/dev/null || true
+command -v update-desktop-database >/dev/null 2>&1 \
+    && update-desktop-database -q "$APPS" 2>/dev/null || true
+say "installed icon and desktop entry"
 
 install -m 644 "$SRC/cpu-hog-watch.service" "$UNITS/cpu-hog-watch.service"
 install -m 644 "$SRC/cpu-hog-watch.timer"   "$UNITS/cpu-hog-watch.timer"

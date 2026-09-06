@@ -34,6 +34,18 @@ set -uo pipefail
 SCRIPT_NAME="$(basename "$0")"
 readonly SCRIPT_NAME
 readonly APP_NAME="CPU Hog Watch"
+
+# The mark, installed by install.sh into the hicolor theme. Falls back to a
+# stock freedesktop name when it is absent, so a clone run straight from the
+# checkout still shows an icon rather than none.
+if [ -r "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps/cpu-hog-watch.svg" ]; then
+    readonly ICON="cpu-hog-watch"
+else
+    readonly ICON="utilities-system-monitor"
+fi
+# Lets the notification daemon tie the popup to the .desktop entry, which is
+# what makes the icon and app name survive grouping in the notification list.
+readonly DESKTOP_HINT="string:desktop-entry:cpu-hog-watch"
 # Popups are resident (-t 0) so an alert cannot fade while you are
 # away from the desk. This bounds the waiting helper, not the popup.
 readonly POPUP_TIMEOUT=21600
@@ -244,7 +256,7 @@ _do_hog() {
     fi
 
     args=(--app-name="$APP_NAME" -u critical -t 0)
-    args+=(-i utilities-system-monitor)
+    args+=(-i "$ICON" --hint="$DESKTOP_HINT")
 
     if [ "$button" = "true" ]; then
         args+=(-A "kill=Stop it")
@@ -292,7 +304,8 @@ _do_thermal() {
 
     read -r tp tpid tcomm <<< "$(printf '%s\n' "$top" | head -1)"
 
-    args=(--app-name="$APP_NAME" -u normal -t 0 -i temperature-warm)
+    args=(--app-name="$APP_NAME" -u normal -t 0 -i "$ICON"
+      --hint="$DESKTOP_HINT")
 
     # Only offer a kill when one process is clearly to blame. A
     # thermal alert with no dominant process is informational: there
