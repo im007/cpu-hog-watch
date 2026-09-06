@@ -35,17 +35,34 @@ SCRIPT_NAME="$(basename "$0")"
 readonly SCRIPT_NAME
 readonly APP_NAME="CPU Hog Watch"
 
-# The mark, installed by install.sh into the hicolor theme. Falls back to a
-# stock freedesktop name when it is absent, so a clone run straight from the
-# checkout still shows an icon rather than none.
-if [ -r "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps/cpu-hog-watch.svg" ]; then
-    readonly ICON="cpu-hog-watch"
-else
-    readonly ICON="utilities-system-monitor"
-fi
-# Lets the notification daemon tie the popup to the .desktop entry, which is
-# what makes the icon and app name survive grouping in the notification list.
-readonly DESKTOP_HINT="string:desktop-entry:cpu-hog-watch"
+# Reverse-DNS application ID, and it has to be reverse-DNS.
+#
+# Icon lookup falls back by truncating at dashes, so the obvious name
+# "cpu-hog-watch" is tried, then "cpu-hog", then "cpu" — and most icon themes
+# ship a "cpu". Papirus does, so the notification silently showed a generic
+# chip instead of this mark. Nothing was missing and nothing errored; the name
+# resolved, just to somebody else's icon. An ID with no dash-truncated prefix
+# in any theme cannot be shadowed that way.
+readonly APP_ID="io.github.im007.cpu-hog-watch"
+
+# Falls back to a stock freedesktop name when the mark is not installed, so a
+# clone run straight from a checkout still shows an icon rather than none.
+# Passed as a PATH, not as the app-id name. The header icon already comes from
+# the .desktop entry via the hint below; when -i names that same icon the
+# daemon shows only the header and drops the large image. A path keeps both:
+# the mark in the header, and the mark again as the notification's own image.
+_icon() {
+    local d="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor" c
+    for c in "$d/scalable/apps/$APP_ID.svg" "$d/128x128/apps/$APP_ID.png"; do
+        [ -r "$c" ] && { printf '%s' "$c"; return 0; }
+    done
+    printf 'utilities-system-monitor'
+}
+ICON="$(_icon)"
+readonly ICON
+# Binds the popup to the .desktop entry, which is what supplies the small icon
+# in the notification header and keeps it once notifications are grouped.
+readonly DESKTOP_HINT="string:desktop-entry:$APP_ID"
 # Popups are resident (-t 0) so an alert cannot fade while you are
 # away from the desk. This bounds the waiting helper, not the popup.
 readonly POPUP_TIMEOUT=21600
