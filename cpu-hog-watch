@@ -223,31 +223,47 @@ usage() {
     exit "${1:-0}"
 }
 
+# Read the env file over the built-in defaults.
+_load_config() {
+    [ -r "$ENV_FILE" ] || return 0
+    set -a
+    # shellcheck disable=SC1090  # resolved at runtime by design
+    . "$ENV_FILE"
+    set +a
+    # Re-read after sourcing: DEBUG was evaluated at script start,
+    # before this file existed in the environment.
+    DEBUG="${SCRIPT_DEBUG:-$DEBUG}"
+    log_debug "loaded config from $ENV_FILE"
+}
+
 main() {
+    local mode=sample
     while [ $# -gt 0 ]; do
         case "$1" in
             --dry-run) DRY_RUN=true ;;
-            --status)  _print_status; exit 0 ;;
-            --detect)  _print_detect; exit 0 ;;
+            --status)  mode=status ;;
+            --detect)  mode=detect ;;
             -h|--help) usage 0 ;;
             *) echo "unknown argument: $1" >&2; usage 2 ;;
         esac
         shift
     done
 
+    # Before ANY mode runs. --status and --detect used to answer from
+    # inside the argument loop, ahead of this, so they printed the
+    # built-in thresholds and ignored THERM_HWMON, THERM_LABEL and
+    # FAN_HWMON - reporting 92C on a machine configured for 65.
+    _load_config
+
+    # The read-only modes need no notifier, so they answer before the
+    # dependency check and still work on a box without libnotify.
+    case "$mode" in
+        status) _print_status; exit 0 ;;
+        detect) _print_detect; exit 0 ;;
+    esac
+
     command -v notify-send >/dev/null 2>&1 || {
         log_error "notify-send not found (dnf install libnotify)"; exit 3; }
-
-    if [ -r "$ENV_FILE" ]; then
-        set -a
-        # shellcheck disable=SC1090  # resolved at runtime by design
-        . "$ENV_FILE"
-        set +a
-        # Re-read after sourcing: DEBUG was evaluated at script start,
-        # before this file existed in the environment.
-        DEBUG="${SCRIPT_DEBUG:-$DEBUG}"
-        log_debug "loaded config from $ENV_FILE"
-    fi
 
     mkdir -p "$STATE_DIR"
 
@@ -422,7 +438,7 @@ main() {
 }
 
 _print_detect() {
-    local src drv lbl path rpm who n h f found
+    local src drv lbl path rpm who n h f found ndev
     printf 'cpu-hog-watch sensor detection\n\n'
 
     printf 'CPU temperature\n'
@@ -431,6 +447,9 @@ _print_detect() {
         lbl="$(printf '%s' "$src" | cut -d'|' -f3)"
         printf '  using   : %s%s\n' "$(_hwmon_real_name "$drv")" \
             "${lbl:+ / $lbl}"
+        ndev="$(_hwmon_all_by_name "$drv" | grep -c .)"
+        [ "$ndev" -gt 1 ] \
+            && printf '  devices : %s, the hottest is read\n' "$ndev"
         printf '  path    : %s\n' "$path"
         printf '  reads   : %s C\n' "$(( $(cat "$path") / 1000 ))"
         if _therm_is_generic "$drv"; then
@@ -471,7 +490,7 @@ _print_detect() {
     fi
     printf '  fan controllers seen:\n'
     found=""
-    for h in /sys/class/hwmon/hwmon*; do
+    for h in "$CPU_HOG_HWMON_ROOT"/hwmon*; do
         n="$(cat "$h/name" 2>/dev/null)" || continue
         for f in "$h"/fan*_input; do
             [ -r "$f" ] || continue
