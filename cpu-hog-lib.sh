@@ -16,6 +16,10 @@
 # Usage:   sourced, not executed.
 #
 
+# Where the kernel exposes hardware monitors. Overridable so the tests
+# can point discovery at a fake tree; nothing else should set it.
+CPU_HOG_HWMON_ROOT="${CPU_HOG_HWMON_ROOT:-/sys/class/hwmon}"
+
 # Ordered probe list for CPU package temperature: "driver|label".
 # An empty label means "this driver exposes one temperature, take it".
 #
@@ -49,13 +53,17 @@ _therm_is_generic() {
     return 1
 }
 
-# Print the hwmon directory whose name file matches $1.
+# Print every hwmon directory whose name file matches $1, one per line.
 # hwmon NUMBERING IS NOT STABLE ACROSS BOOTS, so never address these
 # by number - k10temp can be hwmon12 on one boot and hwmon9 on the
 # next.
-_hwmon_by_name() {
-    local want="$1" h n pre
-    for h in /sys/class/hwmon/hwmon*; do
+#
+# A driver can appear MORE THAN ONCE. A Threadripper exposes one
+# k10temp per die and a dual-socket board one coretemp per package, so
+# "the k10temp device" is not a thing that can be assumed to exist.
+_hwmon_all_by_name() {
+    local want="$1" h n pre rc=1
+    for h in "$CPU_HOG_HWMON_ROOT"/hwmon*; do
         [ -r "$h/name" ] || continue
         n="$(cat "$h/name" 2>/dev/null)"
         case "$want" in
@@ -63,16 +71,24 @@ _hwmon_by_name() {
                 # Prefix probe. Machines expose acpitz_0, acpitz_1 and
                 # so on rather than a bare "acpitz".
                 pre="${want%\*}"
-                if [ "${n#"$pre"}" != "$n" ]; then
-                    printf '%s\n' "$h"; return 0
-                fi
+                [ "${n#"$pre"}" != "$n" ] || continue
                 ;;
             *)
-                if [ "$n" = "$want" ]; then printf '%s\n' "$h"; return 0; fi
+                [ "$n" = "$want" ] || continue
                 ;;
         esac
+        printf '%s\n' "$h"; rc=0
     done
-    return 1
+    return "$rc"
+}
+
+# Print the first hwmon directory whose name file matches $1. Enough
+# for asking whether a driver is present or what it is really called;
+# never use it to pick a temperature - see _temp_input_for.
+_hwmon_by_name() {
+    local all
+    all="$(_hwmon_all_by_name "$1")" || return 1
+    printf '%s\n' "${all%%$'\n'*}"
 }
 
 # Print the real hwmon name behind a probe pattern (acpitz* -> acpitz_0).
@@ -83,24 +99,43 @@ _hwmon_real_name() {
 
 # Print the temp*_input path for driver $1 and label $2, if present.
 # An empty $2 matches a driver exposing exactly one temperature.
+#
+# When several devices carry the driver, the HOTTEST one wins. The
+# backstop exists to catch heat, and the first device enumerated is not
+# reliably the warmest: reading only it left one Threadripper die
+# unwatched. The answer can therefore differ from one call to the next.
 _temp_input_for() {
-    local drv="$1" want="$2" h lbl inp
-    h="$(_hwmon_by_name "$drv")" || return 1
-
-    if [ -z "$want" ]; then
-        for inp in "$h"/temp*_input; do
-            [ -r "$inp" ] && { printf '%s\n' "$inp"; return 0; }
-        done
-        return 1
-    fi
-
-    for lbl in "$h"/temp*_label; do
-        [ -r "$lbl" ] || continue
-        [ "$(cat "$lbl" 2>/dev/null)" = "$want" ] || continue
-        inp="${lbl%_label}_input"
-        [ -r "$inp" ] && { printf '%s\n' "$inp"; return 0; }
-    done
-    return 1
+    local drv="$1" want="$2" h lbl inp cand v
+    local best="" best_v="" first=""
+    while IFS= read -r h; do
+        inp=""
+        if [ -z "$want" ]; then
+            for cand in "$h"/temp*_input; do
+                [ -r "$cand" ] && { inp="$cand"; break; }
+            done
+        else
+            for lbl in "$h"/temp*_label; do
+                [ -r "$lbl" ] || continue
+                [ "$(cat "$lbl" 2>/dev/null)" = "$want" ] || continue
+                cand="${lbl%_label}_input"
+                [ -r "$cand" ] && { inp="$cand"; break; }
+            done
+        fi
+        [ -n "$inp" ] || continue
+        [ -n "$first" ] || first="$inp"
+        v="$(cat "$inp" 2>/dev/null)"
+        # Millidegrees, possibly negative. Anything else is a sensor
+        # that did not answer, and must not win the comparison.
+        case "${v#-}" in ''|*[!0-9]*) continue ;; esac
+        if [ -z "$best" ] || [ "$v" -gt "$best_v" ]; then
+            best="$inp"; best_v="$v"
+        fi
+    done < <(_hwmon_all_by_name "$drv")
+    # No device answered with a number: still name the first match, so
+    # one failed read does not make the driver look absent.
+    [ -n "$best" ] || best="$first"
+    [ -n "$best" ] || return 1
+    printf '%s\n' "$best"
 }
 
 # Print "<path>|<driver>|<label>" for the CPU temperature source.
@@ -124,11 +159,13 @@ _find_temp_source() {
 
 # CPU package temperature in whole degrees C.
 _cpu_temp_c() {
-    local src path
+    local src path v
     src="$(_find_temp_source)" || return 1
     path="${src%%|*}"
     [ -r "$path" ] || return 1
-    printf '%s\n' "$(( $(cat "$path") / 1000 ))"
+    v="$(cat "$path" 2>/dev/null)"
+    case "${v#-}" in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s\n' "$(( v / 1000 ))"
 }
 
 # Print "<rpm>|<driver>" for the fastest fan on the machine.
@@ -136,7 +173,7 @@ _cpu_temp_c() {
 # controller, whoever made it. Explicit FAN_HWMON narrows it.
 _find_fan_source() {
     local h n f v max=0 who=""
-    for h in /sys/class/hwmon/hwmon*; do
+    for h in "$CPU_HOG_HWMON_ROOT"/hwmon*; do
         n="$(cat "$h/name" 2>/dev/null)" || continue
         if [ -n "${FAN_HWMON:-}" ] && [ "${FAN_HWMON}" != "auto" ]; then
             [ "$n" = "$FAN_HWMON" ] || continue

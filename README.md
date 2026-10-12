@@ -89,6 +89,10 @@ Temperature is probed in order, first match winning:
 temperature; `Tctl` is a control value on an arbitrary scale that drives
 fan curves and does not represent a physical temperature.
 
+A driver can appear more than once: a Threadripper has one `k10temp`
+per die, and a dual-socket board one `coretemp` per package. The
+hottest of them is read.
+
 Fans need no list. Any hwmon exposing `fan*_input` is a fan controller,
 and the fastest one is used.
 
@@ -267,6 +271,10 @@ popup outlive the timer run that produced it.
 
 Sensor discovery lives in `cpu-hog-lib.sh`, shared by the watcher and
 the notifier so the two cannot disagree about how heat is measured.
+
+`tests/run.sh` checks sensor discovery and the read-only commands
+against a faked sensor tree. It needs no hardware and no test
+framework.
 
 <details>
 <summary><b>Design notes</b> — why parts of this look the way they do</summary>
