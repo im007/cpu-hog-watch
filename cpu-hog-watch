@@ -61,6 +61,11 @@ HOG_STRIKES="${HOG_STRIKES:-10}"
 THERM_C="${THERM_C:-92}"
 THERM_STRIKES="${THERM_STRIKES:-5}"
 FAN_RPM="${FAN_RPM:-4500}"
+# Fan duty that counts as pinned, as a percentage of full drive. This
+# is the half of the fan backstop that travels: FAN_RPM only means
+# something on the machine it was tuned for. Either one trips it.
+# Anything above 100 turns the duty check off.
+FAN_DUTY_PCT="${FAN_DUTY_PCT:-95}"
 FAN_STRIKES="${FAN_STRIKES:-15}"
 
 # Sensor selection. "auto" walks a probe list covering AMD, Intel and
@@ -178,6 +183,7 @@ _spawn_helper() {
     if command -v systemd-run >/dev/null 2>&1; then
         if systemd-run --user --collect --quiet "--unit=$tag" \
              "--setenv=DBUS_SESSION_BUS_ADDRESS=$bus" \
+             "--setenv=CPU_HOG_ENV_FILE=$ENV_FILE" \
              -- "$NOTIFY_HELPER" "$@"; then
             return 0
         fi
@@ -225,11 +231,7 @@ usage() {
 
 # Read the env file over the built-in defaults.
 _load_config() {
-    [ -r "$ENV_FILE" ] || return 0
-    set -a
-    # shellcheck disable=SC1090  # resolved at runtime by design
-    . "$ENV_FILE"
-    set +a
+    _load_env_file "$ENV_FILE" || return 0
     # Re-read after sourcing: DEBUG was evaluated at script start,
     # before this file existed in the environment.
     DEBUG="${SCRIPT_DEBUG:-$DEBUG}"
@@ -420,12 +422,25 @@ main() {
 
     local fs="${prev_strikes[fan]:-0}" fa="${prev_alerted[fan]:-0}"
     local rpm; rpm="$(_max_fan_rpm || echo 0)"
+    # Pinned by speed, or pinned by duty. The popup quotes an RPM
+    # either way, so a duty trip reports the speed of the fan that
+    # tripped it, which need not be the fastest fan in the case.
+    local dsrc duty="" pinned_rpm=""
     if [ "$rpm" -ge "$FAN_RPM" ]; then
+        pinned_rpm="$rpm"
+    fi
+    if dsrc="$(_find_fan_duty)"; then
+        duty="${dsrc%%|*}"
+        if [ -z "$pinned_rpm" ] && [ "$duty" -ge "$FAN_DUTY_PCT" ]; then
+            pinned_rpm="${dsrc##*|}"
+        fi
+    fi
+    if [ -n "$pinned_rpm" ]; then
         fs=$(( fs + 1 ))
         if [ "$fs" -ge "$FAN_STRIKES" ] \
            && { [ "$fa" -eq 0 ] \
                 || [ "$(( fs - fa ))" -ge "$HOG_RENOTIFY" ]; }; then
-            _alert_thermal fan "$rpm" "$fs"
+            _alert_thermal fan "$pinned_rpm" "$fs"
             fa="$fs"
         fi
     else
@@ -434,7 +449,8 @@ main() {
     printf '#fan %s %s\n' "$fs" "$fa" >> "$tmp"
 
     mv -f "$tmp" "$STATE_FILE"
-    log_debug "sample done: elapsed=${elapsed}j temp=${temp_now}C fan=${rpm}"
+    log_debug "sample done: elapsed=${elapsed}j temp=${temp_now}C" \
+        "fan=${rpm} duty=${duty:-none}"
 }
 
 _print_detect() {
@@ -486,20 +502,33 @@ _print_detect() {
         printf '            needs no driver list.\n' 
     else
         printf '  using   : NOTHING FOUND\n'
-        printf '  effect  : the fan backstop cannot fire\n'
+        printf '  effect  : the fan backstop cannot fire on speed\n'
     fi
-    printf '  fan controllers seen:\n'
+
+    printf '\nFan duty\n'
+    if src="$(_find_fan_duty)"; then
+        printf '  using   : %s (%s%% duty, %s RPM)\n' \
+            "$(printf '%s' "$src" | cut -d'|' -f2)" "${src%%|*}" "${src##*|}"
+        printf '  note    : the hardest-driven fan under automatic\n'
+        printf '            control; FAN_DUTY_PCT applies to this.\n'
+    else
+        printf '  using   : NOTHING FOUND\n'
+        printf '  effect  : no spinning fan under automatic control\n'
+        printf '            reports its duty, so only FAN_RPM can\n'
+        printf '            trip the fan backstop.\n'
+    fi
+    printf '\nFan controllers seen\n'
     found=""
     for h in "$CPU_HOG_HWMON_ROOT"/hwmon*; do
         n="$(cat "$h/name" 2>/dev/null)" || continue
         for f in "$h"/fan*_input; do
             [ -r "$f" ] || continue
-            printf '    %-24s %s RPM\n' \
+            printf '  %-24s %s RPM\n' \
                 "$n/$(basename "$f" _input)" "$(cat "$f" 2>/dev/null)"
             found=y
         done
     done
-    [ -n "$found" ] || printf '    (none on this machine)\n'
+    [ -n "$found" ] || printf '  (none on this machine)\n'
 }
 
 _print_status() {
@@ -509,10 +538,12 @@ _print_status() {
     printf '  hog thresh  : %s%% of one core x %s samples\n' \
         "$HOG_PCT" "$HOG_STRIKES"
     printf '  thermal     : %sC x %s samples\n' "$THERM_C" "$THERM_STRIKES"
-    printf '  fan         : %s RPM x %s samples\n' "$FAN_RPM" "$FAN_STRIKES"
-    local t f
+    printf '  fan         : %s RPM or %s%% duty x %s samples\n' \
+        "$FAN_RPM" "$FAN_DUTY_PCT" "$FAN_STRIKES"
+    local t f d
     t="$(_cpu_temp_c || echo '')"
     f="$(_max_fan_rpm || echo '')"
+    d="$(_find_fan_duty || echo '')"
     if [ -n "$t" ]; then
         printf '  cpu temp now: %sC\n' "$t"
     else
@@ -522,6 +553,11 @@ _print_status() {
         printf '  fan now     : %s RPM\n' "$f"
     else
         printf '  fan now     : unreadable\n'
+    fi
+    if [ -n "$d" ]; then
+        printf '  duty now    : %s%%\n' "${d%%|*}"
+    else
+        printf '  duty now    : not reported\n'
     fi
     if [ -z "$t" ] && [ -z "$f" ]; then
         printf '  sensors     : NONE FOUND - thermal backstop cannot\n'

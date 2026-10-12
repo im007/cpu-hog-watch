@@ -108,21 +108,66 @@ lib() {
     )
 }
 
+# add_pwm ROOT INDEX DRIVER DUTY:ENABLE:RPM...
+# One fan header per triple. An empty ENABLE leaves pwmN_enable out,
+# which is how amdgpu looks when it does not expose the control mode.
+add_pwm() {
+    local root="$1" idx="$2" drv="$3" d n=0 triple duty en rpm
+    shift 3
+    d="$root/hwmon$idx"
+    mkdir -p "$d"
+    printf '%s\n' "$drv" > "$d/name"
+    for triple in "$@"; do
+        n=$(( n + 1 ))
+        duty="${triple%%:*}"; rpm="${triple##*:}"
+        en="${triple#*:}"; en="${en%:*}"
+        printf '%s\n' "$duty" > "$d/pwm$n"
+        [ -n "$en" ] && printf '%s\n' "$en" > "$d/pwm${n}_enable"
+        printf '1\n' > "$d/pwm${n}_mode"
+        printf '%s\n' "$rpm" > "$d/fan${n}_input"
+    done
+}
+
+# A notify-send that records its arguments and answers nothing. The
+# sampling run refuses to start without the real one, so this keeps the
+# suite independent of the host, guarantees no test raises a real
+# notification, and - because it never prints "kill" - guarantees no
+# test can reach the code that signals a process.
+stub_notify() {
+    mkdir -p "$TMP/bin"
+    [ -x "$TMP/bin/notify-send" ] && return 0
+    printf '#!/bin/sh\nprintf "%%s\\n" "$@" >> "%s"\nexit 0\n' \
+        "$TMP/notify.log" > "$TMP/bin/notify-send"
+    chmod +x "$TMP/bin/notify-send"
+}
+
 # Run the watcher against a fake root with its own state directory.
 # watch ROOT ENV_FILE [ARGS...]
 watch() {
     local root="$1" envf="$2"; shift 2
-    mkdir -p "$TMP/run" "$TMP/bin"
-    # The sampling run refuses to start without notify-send. A stub
-    # keeps the suite independent of what the host has installed, and
-    # guarantees no test can raise a real notification.
-    [ -x "$TMP/bin/notify-send" ] || {
-        printf '#!/bin/sh\nexit 0\n' > "$TMP/bin/notify-send"
-        chmod +x "$TMP/bin/notify-send"
-    }
+    mkdir -p "$TMP/run"
+    stub_notify
     PATH="$TMP/bin:$PATH" XDG_RUNTIME_DIR="$TMP/run" \
         CPU_HOG_HWMON_ROOT="$root" CPU_HOG_ENV_FILE="$envf" \
         "$WATCH" "$@" 2>&1
+}
+
+# Run the notifier and print what it would have shown.
+# popup ROOT ENV_FILE ARGS...
+popup() {
+    local root="$1" envf="$2"; shift 2
+    stub_notify
+    : > "$TMP/notify.log"
+    PATH="$TMP/bin:$PATH" CPU_HOG_HWMON_ROOT="$root" \
+        CPU_HOG_ENV_FILE="$envf" "$REPO/cpu-hog-notify" "$@" >/dev/null 2>&1
+    cat "$TMP/notify.log"
+}
+
+# One sampling run from a clean state, so strikes never carry over.
+# sample ROOT ENV_FILE
+sample() {
+    rm -f "$TMP/run/cpu-hog-watch/state"
+    watch "$1" "$2" --dry-run
 }
 
 # ---- temperature source: which device is read ------------------------------
@@ -226,7 +271,7 @@ out="$(watch "$r" "$cfg" --status)"
 assert_contains "--status shows the configured thermal threshold" \
     "$out" "thermal     : 65C x 3 samples"
 assert_contains "--status shows the configured fan threshold" \
-    "$out" "fan         : 1800 RPM x 9 samples"
+    "$out" "fan         : 1800 RPM or 95% duty x 9 samples"
 assert_contains "--status shows the configured hog threshold" \
     "$out" "hog thresh  : 70% of one core x 7 samples"
 assert_contains "--status reads the hottest die" "$out" "cpu temp now: 38C"
@@ -271,6 +316,153 @@ rm -f "$TMP/run/cpu-hog-watch/state"
 out="$(watch "$r" "$cool" --dry-run)"
 assert_lacks "a sampling run stays quiet below the configured threshold" \
     "$out" "would alert thermal"
+
+# ---- a stopped fan is still a fan -------------------------------------------
+
+# A GPU idling in zero-RPM mode. Reporting it as "no fan controller"
+# called a working sensor a missing one.
+r="$(new_root)"
+add_fan "$r" 0 amdgpu 0
+assert_eq "a stopped fan is found" \
+    "$(lib "$r" -- _find_fan_source)" "0|amdgpu/fan1"
+assert_eq "a stopped fan reads as 0 RPM" "$(lib "$r" -- _max_fan_rpm)" "0"
+
+r="$(new_root)"
+add_temp "$r" 0 k10temp Tdie=40000
+if lib "$r" -- _find_fan_source >/dev/null 2>&1; then
+    fail "no fan controller reports failure" "found a fan where there is none"
+else
+    ok "no fan controller reports failure"
+fi
+
+# ---- fan duty: which fan counts ---------------------------------------------
+
+# The X399M Taichi this was measured on: five headers under Smart Fan
+# IV (enable=5), one of them with nothing plugged in.
+r="$(new_root)"
+add_pwm "$r" 0 nct6779 165:5:928 184:5:1059 165:5:1503 165:5:0 165:5:974
+assert_eq "the hardest-driven automatic fan is reported" \
+    "$(lib "$r" -- _find_fan_duty)" "72|nct6779/fan2|1059"
+
+r="$(new_root)"
+add_pwm "$r" 0 nct6779 255:1:2000 120:5:900
+assert_eq "a fan set by hand is left out" \
+    "$(lib "$r" -- _find_fan_duty)" "47|nct6779/fan2|900"
+
+r="$(new_root)"
+add_pwm "$r" 0 nct6779 255:0:2000 120:2:900
+assert_eq "a fan fixed at full speed is left out" \
+    "$(lib "$r" -- _find_fan_duty)" "47|nct6779/fan2|900"
+
+r="$(new_root)"
+add_pwm "$r" 0 nct6779 255:5:0 150:5:1000
+assert_eq "a header with nothing spinning is left out" \
+    "$(lib "$r" -- _find_fan_duty)" "58|nct6779/fan2|1000"
+
+r="$(new_root)"
+add_pwm "$r" 0 amdgpu 200::1400
+if lib "$r" -- _find_fan_duty >/dev/null 2>&1; then
+    fail "a fan with no control mode reports no duty" "duty was reported"
+else
+    ok "a fan with no control mode reports no duty"
+fi
+
+r="$(new_root)"
+add_pwm "$r" 0 amdgpu 230:2:2100
+add_pwm "$r" 1 nct6779 120:5:900
+assert_eq "an explicit fan driver narrows the duty search" \
+    "$(lib "$r" FAN_HWMON=nct6779 -- _find_fan_duty)" "47|nct6779/fan1|900"
+
+# ---- fan backstop: speed or duty --------------------------------------------
+
+one="$TMP/one-strike.env"
+printf '%s\n' 'FAN_STRIKES=1' 'THERM_C=200' > "$one"
+
+# Flat out, yet nowhere near the laptop-sized 4500 RPM default.
+r="$(new_root)"
+add_temp "$r" 0 k10temp Tdie=40000
+add_pwm  "$r" 1 nct6779 250:5:1900 120:5:900
+out="$(sample "$r" "$one")"
+assert_contains "a fan at full duty trips the backstop below FAN_RPM" \
+    "$out" "would alert thermal fan=1900"
+
+r="$(new_root)"
+add_temp "$r" 0 k10temp Tdie=40000
+add_pwm  "$r" 1 nct6779 184:5:1059 165:5:1503
+out="$(sample "$r" "$one")"
+assert_lacks "a fan at ordinary duty stays quiet" "$out" "would alert thermal"
+
+# The pinned fan is the slow one; the fast one is idling.
+r="$(new_root)"
+add_temp "$r" 0 k10temp Tdie=40000
+add_pwm  "$r" 1 nct6779 255:5:800 100:5:1500
+out="$(sample "$r" "$one")"
+assert_contains "a duty trip quotes the pinned fan, not the fastest" \
+    "$out" "would alert thermal fan=800"
+
+off="$TMP/duty-off.env"
+printf '%s\n' 'FAN_STRIKES=1' 'THERM_C=200' 'FAN_DUTY_PCT=101' > "$off"
+r="$(new_root)"
+add_temp "$r" 0 k10temp Tdie=40000
+add_pwm  "$r" 1 nct6779 255:5:1900
+out="$(sample "$r" "$off")"
+assert_lacks "FAN_DUTY_PCT above 100 turns the duty check off" \
+    "$out" "would alert thermal"
+
+rpm_only="$TMP/rpm.env"
+printf '%s\n' 'FAN_STRIKES=1' 'THERM_C=200' 'FAN_RPM=1000' > "$rpm_only"
+r="$(new_root)"
+add_temp "$r" 0 k10temp Tdie=40000
+add_fan  "$r" 1 dell_smm 1500
+out="$(sample "$r" "$rpm_only")"
+assert_contains "FAN_RPM still trips where no duty is reported" \
+    "$out" "would alert thermal fan=1500"
+
+# ---- duty in --status and --detect ------------------------------------------
+
+r="$(new_root)"
+add_temp "$r" 0 k10temp Tdie=40000
+add_pwm  "$r" 1 nct6779 165:5:928 184:5:1059
+out="$(watch "$r" "$TMP/absent.env" --status)"
+assert_contains "--status shows the live duty" "$out" "duty now    : 72%"
+out="$(watch "$r" "$TMP/absent.env" --detect)"
+assert_contains "--detect names the fan the duty check reads" \
+    "$out" "using   : nct6779/fan2 (72% duty, 1059 RPM)"
+
+r="$(new_root)"
+add_temp "$r" 0 k10temp Tdie=40000
+add_fan  "$r" 1 dell_smm 1500
+out="$(watch "$r" "$TMP/absent.env" --status)"
+assert_contains "--status says so when no duty is reported" \
+    "$out" "duty now    : not reported"
+out="$(watch "$r" "$TMP/absent.env" --detect)"
+assert_contains "--detect says only FAN_RPM can trip without a duty" \
+    "$out" "only FAN_RPM can"
+
+# ---- the popup reads the same config as the watcher -------------------------
+
+r="$(new_root)"
+add_temp "$r" 0 k10temp Tctl=63500 Tdie=36500
+add_temp "$r" 1 k10temp Tctl=65600 Tdie=38600
+add_fan  "$r" 2 amdgpu 1200
+add_fan  "$r" 3 nct6779 931 1501
+
+out="$(popup "$r" "$TMP/absent.env" thermal fan 1501 5)"
+assert_contains "the popup shows the auto-selected temperature" \
+    "$out" "CPU 38 °C"
+
+out="$(popup "$r" "$override" thermal fan 1501 5)"
+assert_contains "the popup honours a temperature override" \
+    "$out" "CPU 65 °C"
+
+fan_override="$TMP/fan-override.env"
+printf '%s\n' 'FAN_HWMON=amdgpu' > "$fan_override"
+out="$(popup "$r" "$fan_override" hog "$$" 0 testproc 99 12 40 false)"
+assert_contains "the popup honours a fan override" "$out" "fan 1200 RPM"
+
+out="$(popup "$r" "$TMP/absent.env" hog "$$" 0 testproc 99 12 40 false)"
+assert_contains "the popup shows the fastest fan without an override" \
+    "$out" "fan 1501 RPM"
 
 # -----------------------------------------------------------------------------
 

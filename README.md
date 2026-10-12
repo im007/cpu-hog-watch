@@ -96,6 +96,12 @@ hottest of them is read.
 Fans need no list. Any hwmon exposing `fan*_input` is a fan controller,
 and the fastest one is used.
 
+A fan under automatic control also reports its duty: how hard the
+controller is driving it, whatever speed that produces. A fan held at
+`FAN_DUTY_PCT` of full drive counts as pinned, which is what lets the
+backstop fire on a desktop whose fans never approach a laptop's RPM.
+Fans set by hand, fixed at full speed, or not spinning are left out.
+
 Override either with `THERM_HWMON`, `THERM_LABEL` and `FAN_HWMON` if
 detection picks wrong.
 
@@ -191,7 +197,8 @@ The file holds no secrets.
 | `THERM_C` | `92` | Backstop temperature, °C |
 | `THERM_STRIKES` | `5` | Samples above `THERM_C` before alerting |
 | `FAN_RPM` | `4500` | Backstop fan speed, RPM |
-| `FAN_STRIKES` | `15` | Samples above `FAN_RPM` before alerting |
+| `FAN_DUTY_PCT` | `95` | Backstop fan duty, percent of full drive; above `100` turns it off |
+| `FAN_STRIKES` | `15` | Samples with a fan pinned, by speed or duty, before alerting |
 | `THERM_HWMON` | `auto` | hwmon device for temperature, or `auto` |
 | `THERM_LABEL` | *(empty)* | Temperature label to match, with an explicit device |
 | `FAN_HWMON` | `auto` | hwmon device for fan speed, or `auto` |
