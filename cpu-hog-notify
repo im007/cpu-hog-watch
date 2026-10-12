@@ -75,6 +75,11 @@ readonly SCRIPT_DIR
 # shellcheck source=cpu-hog-lib.sh
 if [ -r "$SCRIPT_DIR/cpu-hog-lib.sh" ]; then
     . "$SCRIPT_DIR/cpu-hog-lib.sh"
+    # The same config the watcher read. Without it THERM_HWMON,
+    # THERM_LABEL and FAN_HWMON reached the watcher and not this
+    # script, so the popup could quote a sensor the alert never used.
+    _load_env_file "${CPU_HOG_ENV_FILE:-$HOME/.config/cpu-hog-watch.env}" \
+        || true
 fi
 
 _log() {

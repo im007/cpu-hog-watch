@@ -172,7 +172,10 @@ _cpu_temp_c() {
 # Fans need no driver list: any hwmon exposing fan*_input is a fan
 # controller, whoever made it. Explicit FAN_HWMON narrows it.
 _find_fan_source() {
-    local h n f v max=0 who=""
+    # max starts below zero so a STOPPED fan still counts as a fan. A
+    # GPU idling in zero-RPM mode used to read as "no fan controller",
+    # which reported a working sensor as a missing one.
+    local h n f v max=-1 who=""
     for h in "$CPU_HOG_HWMON_ROOT"/hwmon*; do
         n="$(cat "$h/name" 2>/dev/null)" || continue
         if [ -n "${FAN_HWMON:-}" ] && [ "${FAN_HWMON}" != "auto" ]; then
@@ -189,6 +192,61 @@ _find_fan_source() {
     done
     [ -n "$who" ] || return 1
     printf '%s|%s\n' "$max" "$who"
+}
+
+# Print "<percent>|<driver>/<fan>|<rpm>" for the hardest-driven fan.
+#
+# Duty is how hard the controller is pushing a fan: pwmN, 0-255. Unlike
+# RPM it means the same thing on every machine. 4500 RPM is flat out
+# for a laptop blower and unreachable for a 140 mm case fan, so an RPM
+# threshold tuned on one can never fire on the other.
+#
+# Two kinds of fan are left out, because neither says anything about
+# heat and either would otherwise read as permanently pinned:
+#   - one not under AUTOMATIC control. pwmN_enable is 0 for "no
+#     control, full speed", 1 for "set by hand", and 2 or more for
+#     automatic, per the kernel's hwmon sysfs interface;
+#   - a header with nothing spinning on it, which still carries a duty.
+_find_fan_duty() {
+    local h n p i en v rpm pct max=-1 who="" at=""
+    for h in "$CPU_HOG_HWMON_ROOT"/hwmon*; do
+        n="$(cat "$h/name" 2>/dev/null)" || continue
+        if [ -n "${FAN_HWMON:-}" ] && [ "${FAN_HWMON}" != "auto" ]; then
+            [ "$n" = "$FAN_HWMON" ] || continue
+        fi
+        for p in "$h"/pwm[0-9]*; do
+            i="${p##*/pwm}"
+            # The glob also matches pwm1_enable, pwm1_mode and friends.
+            case "$i" in ''|*[!0-9]*) continue ;; esac
+            [ -r "$p" ] || continue
+            en="$(cat "${p}_enable" 2>/dev/null)"
+            case "$en" in ''|*[!0-9]*) continue ;; esac
+            [ "$en" -ge 2 ] || continue
+            rpm="$(cat "$h/fan${i}_input" 2>/dev/null)"
+            case "$rpm" in ''|*[!0-9]*) continue ;; esac
+            [ "$rpm" -gt 0 ] || continue
+            v="$(cat "$p" 2>/dev/null)"
+            case "$v" in ''|*[!0-9]*) continue ;; esac
+            pct=$(( v * 100 / 255 ))
+            if [ "$pct" -gt "$max" ]; then
+                max="$pct"; who="$n/fan$i"; at="$rpm"
+            fi
+        done
+    done
+    [ -n "$who" ] || return 1
+    printf '%s|%s|%s\n' "$max" "$who" "$at"
+}
+
+# Source the env file $1, exporting what it sets. Shared so the watcher
+# and the notifier read the same file the same way: a sensor override
+# that reached only one of them would have the popup quote a different
+# temperature from the one that raised it.
+_load_env_file() {
+    [ -r "$1" ] || return 1
+    set -a
+    # shellcheck disable=SC1090  # resolved at runtime by design
+    . "$1"
+    set +a
 }
 
 # Highest fan RPM reported by any fan controller.
