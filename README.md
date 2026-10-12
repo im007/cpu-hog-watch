@@ -216,7 +216,8 @@ process holding a core for ten minutes is worth knowing about.
 |---|---|
 | `cpu-hog-watch` | Take one sample; the timer calls this |
 | `cpu-hog-watch --status` | Thresholds, live readings, anything striking |
-| `cpu-hog-watch --detect` | Which sensors were found, chosen, and rejected |
+| `cpu-hog-watch --detect` | Which sensors were found, chosen, and rejected, and whether each backstop can fire |
+| `cpu-hog-watch --backstops` | The same verdicts for scripts: `kind\|state\|why`, one line each |
 | `cpu-hog-watch --dry-run` | Detect and log, but never notify or kill |
 | `cpu-hog-watch --help` | Usage |
 | `install.sh --verify` | Check a live install |
@@ -238,6 +239,15 @@ What this deliberately does not do.
   automatic and covers AMD, Intel and ARM, but a machine exposing none
   of them gets no backstop. `cpu-hog-watch --detect` states plainly
   what was found; `install.sh --verify` warns if nothing was.
+- **A threshold can only be checked where the hardware states a
+  limit.** A threshold the hardware cannot reach never fires, and
+  `--detect` and `install.sh --verify` call that out as `DEAD`: a
+  temperature at or above the sensor's critical limit, or a fan speed
+  above every fan's stated maximum with no duty to fall back on. Many
+  sensors state no limit at all, `k10temp` on a Threadripper among
+  them. Those are reported as `UNCHECKED`, which means nobody could
+  check, not that the value is fine: compare `THERM_C` with your CPU's
+  rated maximum yourself.
 - **A generic ACPI zone is a fallback, not a measurement.** Where no
   vendor sensor exists, detection falls back to `acpitz`, which may
   report skin or chassis temperature rather than the CPU. Both

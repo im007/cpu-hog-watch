@@ -25,7 +25,8 @@
 #   USER timer, not a system one, so notify-send can reach the Plasma
 #   session bus. A system unit has no session bus and notifies nobody.
 #
-# Usage: cpu-hog-watch [--dry-run] [--status] [--detect] [--help]
+# Usage: cpu-hog-watch [--dry-run] [--status] [--detect] [--backstops]
+#                      [--help]
 #
 # Exit Codes:
 #   0 - Success
@@ -245,6 +246,7 @@ main() {
             --dry-run) DRY_RUN=true ;;
             --status)  mode=status ;;
             --detect)  mode=detect ;;
+            --backstops) mode=backstops ;;
             -h|--help) usage 0 ;;
             *) echo "unknown argument: $1" >&2; usage 2 ;;
         esac
@@ -262,6 +264,12 @@ main() {
     case "$mode" in
         status) _print_status; exit 0 ;;
         detect) _print_detect; exit 0 ;;
+        # For scripts: "<temp|fan>|<ok|dead|unchecked>|<why>", one line
+        # each. install.sh --verify reads this, so the three fields and
+        # the state words are an interface; --detect is the prose.
+        backstops)
+            _backstop_verdicts "$THERM_C" "$FAN_RPM" "$FAN_DUTY_PCT"
+            exit 0 ;;
     esac
 
     command -v notify-send >/dev/null 2>&1 || {
@@ -529,6 +537,21 @@ _print_detect() {
         done
     done
     [ -n "$found" ] || printf '  (none on this machine)\n'
+
+    # For people. Scripts read --backstops, never this.
+    local kind state why
+    printf '\nBackstops\n'
+    while IFS='|' read -r kind state why; do
+        [ "$kind" = "temp" ] && kind="temperature"
+        case "$state" in
+            ok)   state="ok" ;;
+            dead) state="DEAD" ;;
+            *)    state="UNCHECKED" ;;
+        esac
+        printf '  %-11s : %s\n' "$kind" "$state"
+        printf '%s\n' "$why" | fold -s -w 58 \
+            | sed -e 's/[[:space:]]*$//' -e 's/^/      /'
+    done < <(_backstop_verdicts "$THERM_C" "$FAN_RPM" "$FAN_DUTY_PCT")
 }
 
 _print_status() {

@@ -84,6 +84,23 @@ verify() {
         *)
             say "OK  ${sens# *sensors     : }" ;;
     esac
+    # A sensor being present is not the same as its threshold being
+    # reachable: 92 C on a CPU rated for 68, or 4500 RPM on fans that
+    # top out at 1500, is a backstop that exists on paper only. An
+    # unchecked one gets a NOTE, never an OK - the hardware gave nothing
+    # to check it against, which is not the same as it being fine.
+    local kind state why
+    while IFS='|' read -r kind state why; do
+        [ "$kind" = "temp" ] && kind="temperature"
+        case "$state" in
+            dead)
+                say "WARN $kind backstop cannot fire"
+                say "     $why" ;;
+            unchecked)
+                say "NOTE $kind backstop could not be checked"
+                say "     $why" ;;
+        esac
+    done < <("$BIN/cpu-hog-watch" --backstops 2>/dev/null)
     printf '\n'
     systemctl --user list-timers cpu-hog-watch.timer \
         --no-pager 2>/dev/null | head -3
