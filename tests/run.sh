@@ -152,6 +152,35 @@ watch() {
         "$WATCH" "$@" 2>&1
 }
 
+# Write VALUE to an arbitrary sensor file, for limits such as
+# temp1_crit and fan1_max that only some drivers expose.
+# put PATH VALUE
+put() { printf '%s\n' "$2" > "$1"; }
+
+# Run `install.sh --verify` against a throwaway home directory: the
+# three scripts linked where the installer puts them, CONFIG_LINES as
+# the config file, and a systemctl that answers yes to everything.
+# Nothing in the real home or the real user session is read.
+# verify_install ROOT [CONFIG_LINE ...]
+verify_install() {
+    local root="$1" home f; shift
+    home="$(mktemp -d "$TMP/home.XXXXXX")"
+    mkdir -p "$home/.local/bin" "$home/.config" "$TMP/bin"
+    for f in cpu-hog-watch cpu-hog-notify cpu-hog-lib.sh; do
+        ln -s "$REPO/$f" "$home/.local/bin/$f"
+    done
+    [ $# -gt 0 ] && printf '%s\n' "$@" > "$home/.config/cpu-hog-watch.env"
+    stub_notify
+    [ -x "$TMP/bin/systemctl" ] || {
+        printf '#!/bin/sh\nexit 0\n' > "$TMP/bin/systemctl"
+        chmod +x "$TMP/bin/systemctl"
+    }
+    HOME="$home" XDG_DATA_HOME="$home/.local/share" \
+        XDG_RUNTIME_DIR="$TMP/run" PATH="$TMP/bin:$PATH" \
+        CPU_HOG_HWMON_ROOT="$root" CPU_HOG_ENV_FILE='' \
+        "$REPO/install.sh" --verify 2>&1
+}
+
 # Run the notifier and print what it would have shown.
 # popup ROOT ENV_FILE ARGS...
 popup() {
@@ -463,6 +492,143 @@ assert_contains "the popup honours a fan override" "$out" "fan 1200 RPM"
 out="$(popup "$r" "$TMP/absent.env" hog "$$" 0 testproc 99 12 40 false)"
 assert_contains "the popup shows the fastest fan without an override" \
     "$out" "fan 1501 RPM"
+
+# ---- can each backstop fire: the verdicts ------------------------------------
+
+# _backstop_verdicts THERM_C FAN_RPM FAN_DUTY_PCT prints one line per
+# backstop, "<kind>|<state>|<why>". Only the first two fields are pinned
+# here; the wording is for people and is checked through --detect.
+# install.sh reads the same lines through --backstops.
+verdict() {  # verdict ROOT KIND THERM_C FAN_RPM FAN_DUTY_PCT
+    lib "$1" -- _backstop_verdicts "$3" "$4" "$5" \
+        | awk -F'|' -v k="$2" '$1 == k { print $2 }'
+}
+
+# Intel reports a critical limit, so the threshold can be checked.
+r="$(new_root)"
+add_temp "$r" 0 coretemp "Package id 0=52000"
+put "$r/hwmon0/temp1_crit" 100000
+assert_eq "a threshold below the critical limit can fire" \
+    "$(verdict "$r" temp 92 4500 95)" "ok"
+assert_eq "a threshold at the critical limit cannot fire" \
+    "$(verdict "$r" temp 100 4500 95)" "dead"
+assert_eq "a threshold above the critical limit cannot fire" \
+    "$(verdict "$r" temp 105 4500 95)" "dead"
+
+# k10temp on a Threadripper 2950X reports no limit at all. That is not
+# the same as the threshold being fine.
+r="$(new_root)"
+add_temp "$r" 0 k10temp Tctl=63500 Tdie=36500
+assert_eq "no reported limit leaves the threshold unchecked" \
+    "$(verdict "$r" temp 92 4500 95)" "unchecked"
+
+# nct6779 exposes temp1_max = 0. A limit of zero is no limit.
+r="$(new_root)"
+add_temp "$r" 0 coretemp "Package id 0=52000"
+put "$r/hwmon0/temp1_crit" 0
+assert_eq "a critical limit of zero counts as not reported" \
+    "$(verdict "$r" temp 92 4500 95)" "unchecked"
+
+# The limit belongs to the device that is read, which is the hottest.
+r="$(new_root)"
+add_temp "$r" 0 coretemp "Package id 0=52000"
+add_temp "$r" 1 coretemp "Package id 0=57000"
+put "$r/hwmon0/temp1_crit" 100000
+put "$r/hwmon1/temp1_crit" 90000
+assert_eq "the limit is taken from the device being read" \
+    "$(verdict "$r" temp 92 4500 95)" "dead"
+
+r="$(new_root)"
+add_fan "$r" 0 nct6779 931
+assert_eq "no CPU temperature sensor is a dead backstop" \
+    "$(verdict "$r" temp 92 4500 95)" "dead"
+
+# Fan: a reported duty makes the backstop reachable whatever FAN_RPM is.
+r="$(new_root)"
+add_pwm "$r" 0 nct6779 165:5:928 184:5:1059
+assert_eq "a reported duty means the fan backstop can fire" \
+    "$(verdict "$r" fan 92 4500 95)" "ok"
+assert_eq "with the duty check off and no maximum it is unchecked" \
+    "$(verdict "$r" fan 92 4500 101)" "unchecked"
+
+# No duty, but every fan states its maximum.
+r="$(new_root)"
+add_fan "$r" 0 somefan 1400 1200
+put "$r/hwmon0/fan1_max" 3000
+put "$r/hwmon0/fan2_max" 2800
+assert_eq "FAN_RPM above every fan's maximum cannot fire" \
+    "$(verdict "$r" fan 92 4500 95)" "dead"
+assert_eq "FAN_RPM within a fan's maximum can fire" \
+    "$(verdict "$r" fan 92 2900 95)" "ok"
+
+# One fan with no stated maximum could be the one that gets there.
+r="$(new_root)"
+add_fan "$r" 0 somefan 1400 1200
+put "$r/hwmon0/fan1_max" 3000
+assert_eq "a fan with no stated maximum leaves FAN_RPM unchecked" \
+    "$(verdict "$r" fan 92 4500 95)" "unchecked"
+
+r="$(new_root)"
+add_fan "$r" 0 dell_smm 1500
+assert_eq "no duty and no maximum leaves FAN_RPM unchecked" \
+    "$(verdict "$r" fan 92 4500 95)" "unchecked"
+
+r="$(new_root)"
+add_temp "$r" 0 k10temp Tdie=40000
+assert_eq "no fan controller is a dead backstop" \
+    "$(verdict "$r" fan 92 4500 95)" "dead"
+
+# ---- the verdicts in --detect and install.sh --verify ------------------------
+
+# The machine this was written on, as installed with the defaults.
+r="$(new_root)"
+add_temp "$r" 0 k10temp Tctl=63500 Tdie=36500
+add_pwm  "$r" 1 nct6779 165:5:928 184:5:1059
+out="$(watch "$r" "$TMP/absent.env" --detect)"
+assert_contains "--detect has a section for the verdicts" "$out" "Backstops"
+assert_contains "--detect says the temperature threshold is unchecked" \
+    "$out" "temperature : UNCHECKED"
+assert_contains "--detect names the threshold it could not check" \
+    "$out" "THERM_C=92"
+assert_contains "--detect says the fan backstop can fire" "$out" "fan         : ok"
+
+r="$(new_root)"
+add_temp "$r" 0 coretemp "Package id 0=52000"
+put "$r/hwmon0/temp1_crit" 100000
+add_fan "$r" 1 somefan 1400
+put "$r/hwmon1/fan1_max" 3000
+hotcfg="$TMP/too-hot.env"
+printf '%s\n' 'THERM_C=105' > "$hotcfg"
+out="$(watch "$r" "$hotcfg" --detect)"
+assert_contains "--detect flags a temperature threshold past the limit" \
+    "$out" "temperature : DEAD"
+assert_contains "--detect flags a fan threshold no fan can reach" \
+    "$out" "fan         : DEAD"
+
+out="$(watch "$r" "$hotcfg" --backstops)"
+assert_contains "--backstops gives scripts the temperature verdict" \
+    "$out" "temp|dead|"
+assert_contains "--backstops gives scripts the fan verdict" \
+    "$out" "fan|dead|"
+
+out="$(verify_install "$r" 'THERM_C=105')"
+assert_contains "--verify warns that the temperature backstop cannot fire" \
+    "$out" "WARN temperature backstop cannot fire"
+assert_contains "--verify warns that the fan backstop cannot fire" \
+    "$out" "WARN fan backstop cannot fire"
+
+out="$(verify_install "$r" 'THERM_C=92' 'FAN_RPM=2500')"
+assert_lacks "--verify is quiet when both thresholds can fire" \
+    "$out" "backstop"
+
+r="$(new_root)"
+add_temp "$r" 0 k10temp Tctl=63500 Tdie=36500
+add_pwm  "$r" 1 nct6779 165:5:928 184:5:1059
+out="$(verify_install "$r")"
+assert_contains "--verify notes a threshold it could not check" \
+    "$out" "NOTE temperature backstop could not be checked"
+assert_lacks "--verify does not call an unchecked threshold dead" \
+    "$out" "cannot fire"
 
 # -----------------------------------------------------------------------------
 

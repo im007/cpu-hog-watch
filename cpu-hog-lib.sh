@@ -255,3 +255,99 @@ _max_fan_rpm() {
     src="$(_find_fan_source)" || return 1
     printf '%s\n' "${src%%|*}"
 }
+
+# Print "<largest max>|<fans with a max>|<fans without>" over every fan
+# that answers. fanN_max is the fastest a fan says it can turn; few
+# drivers expose it, so the two counts matter as much as the number.
+_fan_max_summary() {
+    local h n f v m largest=0 known=0 unknown=0
+    for h in "$CPU_HOG_HWMON_ROOT"/hwmon*; do
+        n="$(cat "$h/name" 2>/dev/null)" || continue
+        if [ -n "${FAN_HWMON:-}" ] && [ "${FAN_HWMON}" != "auto" ]; then
+            [ "$n" = "$FAN_HWMON" ] || continue
+        fi
+        for f in "$h"/fan*_input; do
+            [ -r "$f" ] || continue
+            v="$(cat "$f" 2>/dev/null)"
+            case "$v" in ''|*[!0-9]*) continue ;; esac
+            m="$(cat "${f%_input}_max" 2>/dev/null)"
+            case "$m" in ''|*[!0-9]*) m=0 ;; esac
+            if [ "$m" -gt 0 ]; then
+                known=$(( known + 1 ))
+                [ "$m" -gt "$largest" ] && largest="$m"
+            else
+                unknown=$(( unknown + 1 ))
+            fi
+        done
+    done
+    printf '%s|%s|%s\n' "$largest" "$known" "$unknown"
+}
+
+# Can each backstop actually fire on this machine?
+# _backstop_verdicts THERM_C FAN_RPM FAN_DUTY_PCT
+#
+# Prints one line per backstop, "<kind>|<state>|<why>", kind being temp
+# or fan. A threshold the hardware can never reach is a safety net that
+# exists on paper only: a 92 C limit on a CPU rated for 68, or a 4500
+# RPM limit on fans that top out at 1500, alerts on nothing and says
+# nothing about it.
+#
+# There are THREE states, and the third must never be reported as the
+# first:
+#   ok        - checked against something the hardware reports, and
+#               reachable;
+#   dead      - checked, and unreachable;
+#   unchecked - the hardware reports nothing to check against. That is
+#               not "fine". k10temp on a Threadripper exposes no limit
+#               at all, so its threshold can only be checked by a
+#               person against the CPU's rated maximum.
+#
+# Only temp*_crit proves a temperature threshold dead. temp*_max is a
+# warning mark the CPU may run above, so passing it proves nothing.
+_backstop_verdicts() {
+    local therm_c="$1" fan_rpm="$2" duty_pct="$3"
+    local src path drv crit sum largest known unknown
+
+    if src="$(_find_temp_source)"; then
+        path="${src%%|*}"
+        drv="$(_hwmon_real_name "$(printf '%s' "$src" | cut -d'|' -f2)")"
+        crit="$(cat "${path%_input}_crit" 2>/dev/null)"
+        case "$crit" in ''|*[!0-9]*) crit=0 ;; esac
+        if [ "$crit" -le 0 ]; then
+            printf 'temp|unchecked|%s reports no critical limit; compare THERM_C=%s with the rated maximum of this CPU\n' \
+                "$drv" "$therm_c"
+        elif [ "$(( therm_c * 1000 ))" -ge "$crit" ]; then
+            printf 'temp|dead|THERM_C=%s is at or above the %s C critical limit %s reports\n' \
+                "$therm_c" "$(( crit / 1000 ))" "$drv"
+        else
+            printf 'temp|ok|THERM_C=%s is below the %s C critical limit %s reports\n' \
+                "$therm_c" "$(( crit / 1000 ))" "$drv"
+        fi
+    else
+        printf 'temp|dead|no CPU temperature sensor was found\n'
+    fi
+
+    if ! _find_fan_source >/dev/null; then
+        printf 'fan|dead|no fan controller was found\n'
+        return 0
+    fi
+    if [ "$duty_pct" -le 100 ] && src="$(_find_fan_duty)"; then
+        printf 'fan|ok|%s reports its duty, so FAN_DUTY_PCT=%s can be reached\n' \
+            "$(printf '%s' "$src" | cut -d'|' -f2)" "$duty_pct"
+        return 0
+    fi
+    # Speed is the only way left to trip it.
+    sum="$(_fan_max_summary)"
+    largest="${sum%%|*}"; unknown="${sum##*|}"
+    known="${sum#*|}"; known="${known%|*}"
+    if [ "$unknown" -gt 0 ] || [ "$known" -eq 0 ]; then
+        printf 'fan|unchecked|no usable duty, and not every fan states a maximum, so FAN_RPM=%s cannot be checked\n' \
+            "$fan_rpm"
+    elif [ "$fan_rpm" -gt "$largest" ]; then
+        printf 'fan|dead|FAN_RPM=%s is above the highest stated fan maximum of %s RPM, with no usable duty\n' \
+            "$fan_rpm" "$largest"
+    else
+        printf 'fan|ok|FAN_RPM=%s is within the highest stated fan maximum of %s RPM\n' \
+            "$fan_rpm" "$largest"
+    fi
+}
