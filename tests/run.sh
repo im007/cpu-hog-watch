@@ -346,6 +346,26 @@ out="$(watch "$r" "$cool" --dry-run)"
 assert_lacks "a sampling run stays quiet below the configured threshold" \
     "$out" "would alert thermal"
 
+# ---- a hog with a one-word command line -------------------------------------
+
+# `yes` has argv[0] and nothing else. Reading the missing argv[1] under
+# set -u killed the whole run with "2: unbound variable", so the hog was
+# never reported. This samples a real process, so it needs two runs with
+# the hog burning a core in between.
+hogcfg="$TMP/hog.env"
+printf '%s\n' 'HOG_PCT=50' 'HOG_STRIKES=1' 'THERM_C=200' > "$hogcfg"
+rm -f "$TMP/run/cpu-hog-watch/state"
+yes > /dev/null &
+hog=$!
+watch "$r" "$hogcfg" --dry-run > /dev/null
+sleep 2
+out="$(watch "$r" "$hogcfg" --dry-run)"
+kill "$hog" 2>/dev/null; wait "$hog" 2>/dev/null
+assert_lacks "a one-word command line does not abort the run" \
+    "$out" "unbound variable"
+assert_contains "a hog with a one-word command line is reported" \
+    "$out" "would alert on pid=$hog (yes)"
+
 # ---- a stopped fan is still a fan -------------------------------------------
 
 # A GPU idling in zero-RPM mode. Reporting it as "no fan controller"
