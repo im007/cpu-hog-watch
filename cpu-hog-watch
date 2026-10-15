@@ -370,8 +370,16 @@ main() {
             # Haystack is comm plus the basenames of argv[0] and argv[1] —
             # enough for "go build" and for wrappers like
             # "python3 /usr/bin/dnf", without scanning user data.
-            set -- $cmdline
-            _hay=" $comm ${1##*/} ${2##*/} "
+            #
+            # read -ra, not `set -- $cmdline`: a one-word command line left
+            # $2 unset, which aborted the whole run under set -u (71 failed
+            # runs, 2026-10-04 to 10-12), and the unquoted expansion would
+            # also glob an argument like "*.py" against the cwd.
+            local -a argv=()
+            local arg0 arg1
+            read -ra argv <<< "$cmdline" || true
+            arg0="${argv[0]-}"; arg1="${argv[1]-}"
+            _hay=" $comm ${arg0##*/} ${arg1##*/} "
             # Whitespace-anchored so entries match whole tokens: "xz" no
             # longer matches "xzcompress-bench.py".
             if printf '%s' "$_hay" \
