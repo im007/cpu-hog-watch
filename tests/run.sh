@@ -630,6 +630,31 @@ assert_contains "--verify notes a threshold it could not check" \
 assert_lacks "--verify does not call an unchecked threshold dead" \
     "$out" "cannot fire"
 
+# ---- hog detection: command lines the allowlist check has to survive --------
+
+# A hot process with a one-word command line ("yes", or any binary run
+# with no arguments) left $2 unset, and set -u killed the whole run.
+# The watcher went blind for as long as such a process was busy: it
+# failed 17 of 30 runs while a runaway browser tab was pegged, so the
+# alert came late.
+r="$(new_root)"
+hogcfg="$TMP/hog.env"
+printf '%s\n' 'HOG_PCT=50' 'HOG_STRIKES=1' > "$hogcfg"
+rm -f "$TMP/run/cpu-hog-watch/state"
+yes > /dev/null &
+yes_pid=$!
+watch "$r" "$hogcfg" --dry-run > /dev/null
+sleep 2
+out="$(watch "$r" "$hogcfg" --dry-run)"
+kill "$yes_pid" 2>/dev/null
+wait "$yes_pid" 2>/dev/null
+assert_lacks "a one-word command line does not kill the run" \
+    "$out" "unbound variable"
+# The control: without it, a run that never measured the process would
+# pass the check above for the wrong reason.
+assert_contains "a hot one-word command line is still alerted on" \
+    "$out" "pid=$yes_pid"
+
 # -----------------------------------------------------------------------------
 
 printf '\n%s passed, %s failed\n' "$passed" "$failed"
